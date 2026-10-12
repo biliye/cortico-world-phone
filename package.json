@@ -1,8 +1,8 @@
 {
   "name": "cortico-world-phone",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
-  "description": "Cortico World: 电话——接起真来电、听到对方、说出她的话、挂断(耳朵=本机语音识别,嗓子=TTS,话机=另一个进程里的桥)",
+  "description": "Cortico World:电话——接得起真来电、听得见对方、说得出她的话、挂断。★ 非即插即用:装之前先把它交给一个 coding agent,从 AGENTS.md 读起 —— 这条线要另起一个跑 QQ 的协议端,每个决定都是环境相关的(见 docs/route-*)。耳朵=本机语音识别,嗓子=TTS。",
   "license": "MIT",
   "repository": {
     "type": "git",
