@@ -1,0 +1,34 @@
+{
+  "//": "界面驱动版桥(sl-bridge.mjs)的配置样例。放到容器里任何位置,用 `node sl-bridge.mjs <这个文件>` 起。",
+  "//host": "跑在容器里(bridge 网络)时用 0.0.0.0:容器的回环与宿主的不是同一个,隧道要连容器地址;容器没发布端口 ⇒ 外面够不着。桥跑在宿主网络(--network host)时必须换回 127.0.0.1,否则等于把口暴露在公网上。",
+  "host": "0.0.0.0",
+  "port": 6120,
+  "//token": "要么直接写 token,要么给 tokenFile。这个文件 600,属主是跑桥的那个 uid。",
+  "token": "换成你自己的随机串(openssl rand -hex 24)",
+  "audio": {
+    "//": "两条 null sink 的名字;QQ 自动用默认设备,所以 default-sink/source 要指到它们上。",
+    "sampleRate": 48000,
+    "channels": 2,
+    "sinkMonitor": "sl_speaker.monitor",
+    "micSink": "sl_mic",
+    "//pulseServer": "PulseAudio 的 socket 路径。以 uid 1000 + XDG_RUNTIME_DIR=/tmp/runtime-1000 起的那条最稳(和 QQ 自己的 uid 一致)。",
+    "pulseServer": "unix:/tmp/runtime-1000/pulse/native",
+    "frameMs": 100
+  },
+  "gui": {
+    "display": ":1",
+    "//windowName": "来电独立窗的标题。**别改成多字节模式交给 xdotool** —— 见 bridge 文件头那条实测。",
+    "windowName": "语音",
+    "acceptAt": [118, 508],
+    "hangupAt": [288, 509],
+    "rejectAt": [292, 508],
+    "readyDelayMs": 400,
+    "pollMs": 1000
+  },
+  "call": {
+    "//expectedCallerUin": "★ 这不是事实,是预设:界面驱动版看不出号码,报的一律是这一串。填他(唯一会打进来的那个人)的号,World 那边才不会把它当陌生号拒掉。",
+    "expectedCallerUin": "10001",
+    "acceptUnknown": true,
+    "ringTimeoutSec": 60
+  }
+}

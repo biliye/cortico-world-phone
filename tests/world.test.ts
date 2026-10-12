@@ -1,0 +1,921 @@
+/**
+ * World 的一级验证(不碰真电话):假桥 + 假识别 + 假嗓子,把整条路走一遍。
+ *
+ * 用的都是**真的那几份实现**:真的分段器、真的重采样、真的状态机、真的 `ws` 客户端。
+ * 只有三个"外面"被换掉:桥、识别服务、合成服务 —— 那三个是别人的东西,
+ * 而在这一级要验的是"我们这边接得对不对"。
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts';
+import { PHONE } from '../src/definition.ts';
+import { PHONE_DEFAULTS, type PhoneConfigSection } from '../src/config.ts';
+import { PhoneWorld } from '../src/world.ts';
+import { FakeHost } from './helpers/fake-host.ts';
+import { FakeBridge } from './helpers/fake-bridge.ts';
+import { silence, stereo, tone, wavHex } from './helpers/wav.ts';
+
+const HIM = 10002;
+const TOKEN = 'phone-bridge-token-for-tests-0123456789';
+
+let scratch: string;
+let bridge: FakeBridge | undefined;
+let world: PhoneWorld | undefined;
+
+beforeEach(() => {
+  scratch = mkdtempSync(join(tmpdir(), 'phone-world-'));
+});
+afterEach(async () => {
+  await world?.stop();
+  world = undefined;
+  await bridge?.close();
+  bridge = undefined;
+  rmSync(scratch, { recursive: true, force: true });
+});
+
+async function waitFor(predicate: () => boolean, timeoutMs = 6000, what = '那个状态'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`等不到${what}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/** 假识别 + 假嗓子。按 URL 分流:走 `/asr` 的是耳朵,其余的当嗓子。 */
+function fakeServices(options: { herSpeech?: Buffer; speakDelayMs?: number; asrText?: string } = {}): typeof fetch {
+  const herSpeech = options.herSpeech ?? tone(2000, 32000, 520);
+  return (async (input: string | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes('/asr')) return new Response(JSON.stringify({ text: options.asrText ?? '你好呀,我听着呢' }), { status: 200 });
+    if (options.speakDelayMs) await new Promise((r) => setTimeout(r, options.speakDelayMs));
+    void init;
+    return new Response(
+      JSON.stringify({
+        data: { audio: wavHex(herSpeech, 32000) },
+        extra_info: { audio_length: (herSpeech.length / 2 / 32000) * 1000 },
+        base_resp: { status_code: 0, status_msg: 'success' },
+      }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+}
+
+async function startWorld(over: Partial<PhoneConfigSection> = {}, services = fakeServices()): Promise<FakeHost> {
+  bridge = new FakeBridge(TOKEN);
+  const url = await bridge.listen();
+  const cfg: PhoneConfigSection = {
+    ...structuredClone(PHONE_DEFAULTS),
+    enabled: true,
+    bridgeUrl: url,
+    tokenSecret: 'TEST_PHONE_TOKEN',
+    callers: [HIM],
+    tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+    ...over,
+  };
+  world = new PhoneWorld({
+    cfg,
+    timezone: 'Asia/Shanghai',
+    dataDir: scratch,
+    secret: () => TOKEN,
+    fetchImpl: services,
+  });
+  const host = new FakeHost();
+  await world.start(host);
+  // start() 只是**开始**连:等桥真连上再往下走，否则测的是"还没连上时会怎样"。
+  await waitFor(() => bridge!.connected, 5000, '桥连上');
+  return host;
+}
+
+/** 喂一段"有人在说话":先给底噪立门限,再给声音,最后用静音收句。 */
+async function feedSpeech(callId: string, ms = 1200): Promise<void> {
+  bridge!.pushAudioFrame(callId, stereo(silence(300, 48000, 30)));
+  await new Promise((r) => setTimeout(r, 30));
+  bridge!.pushAudioFrame(callId, stereo(tone(ms, 48000)));
+  await new Promise((r) => setTimeout(r, 30));
+  bridge!.pushAudioFrame(callId, stereo(silence(1000, 48000, 30)));
+}
+
+describe('干装载与声明', () => {
+  it('装载器接受它:默认配置、无密钥也能构造', async () => {
+    const report = await dryMountWorld(PHONE, { scratchDir: scratch });
+    expect(report.failures).toEqual([]);
+  });
+
+  it('五个工具都在,名字带 phone_ 前缀', () => {
+    const instance = PHONE.create(fakeWorldContext(PHONE, { scratchDir: scratch }));
+    expect(instance.tools().map((t) => t.name).sort()).toEqual([
+      'phone_answer',
+      'phone_dial',
+      'phone_hangup',
+      'phone_status',
+      'phone_stop',
+    ]);
+  });
+
+  it('默认禁用:装上去不会自己开始打电话', () => {
+    expect(PHONE_DEFAULTS.enabled).toBe(false);
+  });
+
+  it('环境提示词的四个占位符都有值(没通话时也说清楚)', () => {
+    const instance = PHONE.create(fakeWorldContext(PHONE, { scratchDir: scratch }));
+    const vars = instance.envPromptVars() as Record<string, string>;
+    expect(vars['phone.callers']).toBeDefined();
+    expect(vars['phone.state']).toContain('没有通话');
+    // 拨号目标没配时要写"没配" —— 空着会让提示词读成"她随时能拨",而实际拨不出去。
+    expect(vars['phone.dialTo']).toContain('没配');
+    // 打断这件事两种配置下的说法不一样,但都得有字。
+    expect(vars['phone.interrupt']!.length).toBeGreaterThan(10);
+  });
+
+  it('配了拨号目标:那个称呼进提示词', () => {
+    const ctx = fakeWorldContext(PHONE, { scratchDir: scratch });
+    // `ctx.cfg` 是活引用(与部署里那份同一个对象),所以就地改它等于改配置。
+    (ctx.cfg as { dial?: { target: string; label: string } }).dial = { target: 'u_x', label: '主人' };
+    const instance = PHONE.create(ctx);
+    expect((instance.envPromptVars() as Record<string, string>)['phone.dialTo']).toBe('主人');
+  });
+});
+
+describe('来电 → 接起 → 听见 → 她说话 → 挂断', () => {
+  it('白名单来电自动接起,接通后投 phone.connected', async () => {
+    const host = await startWorld();
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'accept'), 4000, '接听命令');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    const connected = host.events.find((e) => e.type === 'phone.connected')!;
+    expect(connected.text).toContain('【电话】');
+    expect(connected.text).toContain(String(HIM));
+    expect(connected.origin).toBe('external');
+  });
+
+  it('对方说完一句 → 识别 → 当成事件给她', async () => {
+    const host = await startWorld();
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    await feedSpeech('c1');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.speech'), 8000, '她听到的一句');
+    const speech = host.events.find((e) => e.type === 'phone.speech')!;
+    expect(speech.text).toContain('你好呀,我听着呢');
+    expect(speech.text).toContain('【电话·对方】');
+    expect(speech.origin).toBe('external');
+  });
+
+  it('她的正文被切句、合成、写成音频帧发回桥', async () => {
+    await startWorld();
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'accept'), 6000, '接听命令');
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected', 6000, '桥这边变成已接通');
+    const tap = world!.outputTap()!;
+    tap.onEvent({ type: 'response.output_text.delta', delta: '我听着呢。你说吧。' } as never);
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.write'), 8000, '发回桥的音频');
+    const write = bridge!.requests.find((r) => r.op === 'audio.write')!;
+    const frame = write.args.frame as Record<string, unknown>;
+    expect(frame.encoding).toBe('pcm_s16le');
+    expect(frame.sampleRate).toBe(48000);
+    expect(frame.channels).toBe(2);
+    const pcm = Buffer.from(String(frame.data), 'base64');
+    expect(pcm.length % 4).toBe(0);
+    expect(pcm.length).toBeLessThanOrEqual(48000 * 2 * 2);
+    expect(typeof write.args.playbackId).toBe('string');
+  });
+
+  it('挂断后投 phone.ended,里面带历时与两边各说了多少', async () => {
+    const host = await startWorld();
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    await feedSpeech('c1');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.speech'), 8000, '她听到的一句');
+    bridge!.setPhase('c1', 'ended');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ended'));
+    const ended = host.events.find((e) => e.type === 'phone.ended')!;
+    expect(ended.text).toContain('通话结束');
+    expect(ended.text).toContain(String(HIM));
+    expect(ended.text).toContain('你听到了对方 1 句');
+  });
+});
+
+describe('规矩', () => {
+  it('陌生号直接拒,连响都不让她知道', async () => {
+    const host = await startWorld();
+    bridge!.ring('c2', '999999');
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'reject'), 4000, '拒绝命令');
+    expect(bridge!.requests.some((r) => r.op === 'accept')).toBe(false);
+    expect(host.events.some((e) => e.type === 'phone.connected')).toBe(false);
+    expect(host.events.some((e) => e.text.includes('不在接听名单里'))).toBe(true);
+  });
+
+  it('手动模式下不自动接,而是问她一句', async () => {
+    const host = await startWorld({ autoAnswer: false });
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ringing'), 4000, '响铃事件');
+    expect(bridge!.requests.some((r) => r.op === 'accept')).toBe(false);
+    expect(host.pushOpts.find((_, i) => host.events[i]?.type === 'phone.ringing')?.trigger).toBe('preempt');
+  });
+
+  /**
+   * 想法一(2026-10-11 他提的):界面驱动那版桥**只看得见像素、报不出号码**,
+   * 于是响铃时抓一张来电界面交给她 —— 她读得出图上的名字,自己决定接不接。
+   */
+  it('★ 响铃时把来电截图当附件投给她,正文指向图、不拿预设号当事实', async () => {
+    const host = await startWorld({ autoAnswer: false });
+    const png = Buffer.alloc(4096, 9).toString('base64');
+    bridge!.onRequest = (op) =>
+      op === 'screenshot' ? { ok: true, data: { pngBase64: png, mime: 'image/png', width: 360, height: 640 } } : undefined;
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ringing'), 4000, '响铃事件');
+    const ring = host.events.find((e) => e.type === 'phone.ringing')!;
+    expect(bridge!.requests.some((r) => r.op === 'screenshot')).toBe(true);
+    expect(ring.blobs).toHaveLength(1);
+    expect(ring.blobs![0]!.mime).toBe('image/png');
+    expect(ring.blobs![0]!.fallbackText).toContain('截图');
+    expect(ring.text).toContain('以图为准');
+  });
+
+  it('老桥(不认 screenshot 这个 op)照常响:没有附件,正文里还是桥报的那个号', async () => {
+    const host = await startWorld({ autoAnswer: false });
+    bridge!.onRequest = (op) =>
+      op === 'screenshot' ? { ok: false, error: { code: 'UNKNOWN_OP', message: '不认这个 op' } } : undefined;
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ringing'), 4000, '响铃事件');
+    const ring = host.events.find((e) => e.type === 'phone.ringing')!;
+    expect(ring.blobs ?? []).toHaveLength(0);
+    expect(ring.text).toContain(String(HIM));
+  });
+
+  it('响铃超时自动拒(用户定的 30 秒,测试里改成 1 秒)', async () => {
+    const host = await startWorld({ autoAnswer: false, ringTimeoutSec: 1 });
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'reject'), 6000, '超时拒绝');
+    expect(host.events.some((e) => e.text.includes('自动拒了'))).toBe(true);
+  });
+
+  it('她说话时对方一开口:清掉还没放出去的音频,并把这一句按 preempt 投', async () => {
+    bridge = new FakeBridge(TOKEN);
+    bridge.audioWriteDelayMs = 150;
+    const url = await bridge.listen();
+    const cfg: PhoneConfigSection = {
+      ...structuredClone(PHONE_DEFAULTS),
+      enabled: true,
+      bridgeUrl: url,
+      tokenSecret: 'TEST_PHONE_TOKEN',
+      callers: [HIM],
+      tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+    };
+    world = new PhoneWorld({
+      cfg,
+      timezone: 'Asia/Shanghai',
+      dataDir: scratch,
+      secret: () => TOKEN,
+      fetchImpl: fakeServices({ herSpeech: tone(6000, 32000, 520) }),
+    });
+    const host = new FakeHost();
+    await world.start(host);
+    await waitFor(() => bridge!.connected, 5000, '桥连上');
+
+    bridge.ring('c1', String(HIM));
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'accept'), 6000, '接听命令');
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    // 她一开口就是一大段(6 秒):发送侧因为写回执慢,队列一直有货。
+    world.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '我跟你讲啊,这件事是这样的。' } as never);
+    await waitFor(() => bridge!.requests.filter((r) => r.op === 'audio.write').length >= 2, 8000, '开始发音频');
+
+    await feedSpeech('c1', 900);
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.clear'), 8000, '清队列');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.speech'), 8000, '她听到的那一句');
+    const index = host.events.findIndex((e) => e.type === 'phone.speech');
+    expect(host.pushOpts[index]?.trigger).toBe('preempt');
+  });
+
+  it('★ 一小块响动不到门槛就不算抢话 —— 实测那次打断她的是一块不到 400 毫秒的脉冲', async () => {
+    await startWorld({}, fakeServices({ herSpeech: tone(6000, 32000, 520) }));
+    bridge!.audioWriteDelayMs = 150;
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '我跟你讲啊,这件事是这样的。' } as never);
+    await waitFor(() => bridge!.requests.filter((r) => r.op === 'audio.write').length >= 2, 8000, '开始发音频');
+
+    await feedSpeech('c1', 300); // 300 毫秒 < 门槛 500
+    await new Promise((r) => setTimeout(r, 400));
+    expect(bridge!.requests.some((r) => r.op === 'audio.clear')).toBe(false);
+
+    await feedSpeech('c1', 900); // 够久了 —— 这时才该清
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.clear'), 8000, '清队列');
+  });
+
+  it('门槛是旋钮:调大到 2000 毫秒,900 毫秒的话就不算抢话', async () => {
+    await startWorld({ bargeInMinMs: 2000 }, fakeServices({ herSpeech: tone(6000, 32000, 520) }));
+    bridge!.audioWriteDelayMs = 150;
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '我跟你讲啊,这件事是这样的。' } as never);
+    await waitFor(() => bridge!.requests.filter((r) => r.op === 'audio.write').length >= 2, 8000, '开始发音频');
+
+    await feedSpeech('c1', 900);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(bridge!.requests.some((r) => r.op === 'audio.clear')).toBe(false);
+  });
+
+  it('往外写音频按播放的速度走:一整句不会一口气灌满桥那条 2 秒队列', async () => {
+    await startWorld({}, fakeServices({ herSpeech: tone(6000, 32000, 520) }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    const writes = (): number => bridge!.requests.filter((r) => r.op === 'audio.write').length;
+
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '这一句话很长,长到要分成十几块才发得完。' } as never);
+    await waitFor(() => writes() >= 2, 8000, '开始发音频');
+    await new Promise((r) => setTimeout(r, 700));
+
+    // 6 秒音频 = 15 块(每块 400ms)。配速之后 700 毫秒里发不出十几块;没配速时会一口气全灌进去
+    // —— 那正是 2026-10-09 "Audio output queue is full" 丢掉她 2.8 秒音频的成因。
+    expect(writes()).toBeLessThanOrEqual(6);
+  });
+
+  it('★ 长到不像脉冲却一个字都没认出来:告诉她"没听清",不静默丢掉', async () => {
+    const host = await startWorld({}, fakeServices({ asrText: '' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+
+    await feedSpeech('c1', 2000); // 2 秒 —— 不像脉冲,该说"没听清"
+    await waitFor(() => host.events.some((e) => e.text.includes('没听清')), 8000, '没听清那条');
+
+    await feedSpeech('c1', 600); // 短的那一段照旧当噪声丢掉
+    await new Promise((r) => setTimeout(r, 600));
+    expect(host.events.filter((e) => e.text.includes('没听清'))).toHaveLength(1);
+  });
+
+  it('★ 桥那条队列满时:那一块放回队首重试,**一块都不丢**', async () => {
+    await startWorld({}, fakeServices({ herSpeech: tone(2400, 32000, 520) })); // 2.4 秒 = 6 块
+    let full = true;
+    bridge!.onRequest = (op) =>
+      op === 'audio.write' && full
+        ? { ok: false, error: { code: 'BRIDGE_ERROR', message: 'Audio output queue is full.' } }
+        : undefined;
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '我跟你讲啊,这件事是这样的。' } as never);
+
+    const sequences = (): Set<number> =>
+      new Set(
+        bridge!.requests
+          .filter((r) => r.op === 'audio.write')
+          .map((r) => (r.args.frame as { sequence?: number } | undefined)?.sequence)
+          .filter((s): s is number => typeof s === 'number'),
+      );
+    await waitFor(() => bridge!.requests.filter((r) => r.op === 'audio.write').length >= 3, 8000, '撞上满队列');
+
+    full = false; // 队列通了
+    await waitFor(() => sequences().size >= 6, 15000, '把丢掉的那几块补上来');
+  });
+
+  it('★ 她自己按停(phone_stop):没念完的收掉,这一轮剩下的不再念', async () => {
+    await startWorld({}, fakeServices({ herSpeech: tone(4000, 32000, 520) }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    const writes = (): number => bridge!.requests.filter((r) => r.op === 'audio.write').length;
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '我跟你讲啊,这件事是这样的。' } as never);
+    await waitFor(() => writes() >= 2, 8000, '开始发音频');
+
+    const stop = world!.tools().find((t) => t.name === 'phone_stop')!;
+    expect(String(await stop.handler({}, {} as never))).toContain('停');
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.clear'), 8000, '清队列');
+
+    // 这一轮剩下的话不再念(否则她会一边说"好我停了"一边把后半段念完)
+    const before = writes();
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '后半段不该念出来。' } as never);
+    await new Promise((r) => setTimeout(r, 600));
+    expect(writes()).toBe(before);
+
+    // 下一轮照常能说
+    world!.outputTap()!.onEvent({ type: 'response.created' } as never);
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '下一轮可以说了。' } as never);
+    await waitFor(() => writes() > before, 8000, '新一轮出声');
+  });
+
+  it('★ 长到不像脉冲、正文却短得不可能:当成"没听清"投给她', async () => {
+    const host = await startWorld({}, fakeServices({ asrText: '段。' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    await feedSpeech('c1', 6000); // 6 秒却只有两个字的正文 ⇒ 每秒钟不到半个字,不可能是一句话
+    await waitFor(() => host.events.some((e) => e.text.includes('没听清')), 8000, '没听清那条');
+  });
+
+  it('★ "说够了"的闸门是**每一轮**的额度:下一轮照常出声(整通只复位一次会让后面全哑)', async () => {
+    await startWorld({ maxSpeakSec: 1 }, fakeServices({ herSpeech: tone(1200, 32000, 520) }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    const writes = (): number => bridge!.requests.filter((r) => r.op === 'audio.write').length;
+
+    // 第一轮说两句:第一句就把额度(1 秒)用掉了,第二句该被拦住
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '第一句我多说几个字。' } as never);
+    await waitFor(() => writes() >= 3, 8000, '第一句出声');
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '第二句应该被拦下。' } as never);
+    await new Promise((r) => setTimeout(r, 500));
+    const afterFirstRound = writes();
+    expect(afterFirstRound).toBeLessThanOrEqual(4);
+
+    // 新一轮:额度重来 —— 这是他那通"看得到回复听不到声"的那一条
+    world!.outputTap()!.onEvent({ type: 'response.created' } as never);
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '新一轮我还能说话。' } as never);
+    await waitFor(() => writes() > afterFirstRound + 1, 8000, '新一轮出声');
+  });
+
+  it('★ 桥那条队列一直满:卡够久才提醒她一次(几帧抖动不惊动,一通也只说一次)', async () => {
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(800, 32000, 520) }));
+    bridge!.onRequest = (op) =>
+      op === 'audio.write'
+        ? { ok: false, error: { code: 'BRIDGE_ERROR', message: 'Audio output queue is full.' } }
+        : undefined;
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '我说一句。' } as never);
+    await waitFor(() => host.events.some((e) => e.text.includes('放得很慢')), 10000, '那一声提醒');
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(host.events.filter((e) => e.text.includes('放得很慢'))).toHaveLength(1);
+  });
+
+  it('通话卡在 rejecting 太久:报出来,并说清自愈命令没配', async () => {
+    const host = await startWorld({ stuckSec: 1 });
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    bridge!.setPhase('c1', 'rejecting');
+    await waitFor(() => host.events.some((e) => e.text.includes('卡在')), 6000, '卡住那条通知');
+    const notice = host.events.find((e) => e.text.includes('卡在'))!;
+    expect(notice.type).toBe('phone.notice');
+    expect(notice.origin).toBe('internal');
+    expect(notice.text).toContain('recoverCommand');
+  });
+});
+
+describe('工具回执', () => {
+  it('phone_status 说清有没有通话、名单、桥通不通', async () => {
+    await startWorld();
+    const status = world!.tools().find((t) => t.name === 'phone_status')!;
+    const text = String(await status.handler({}, {} as never));
+    expect(text).toContain('现在没有通话');
+    expect(text).toContain(String(HIM));
+    expect(text).toContain('桥连着');
+  });
+
+  it('phone_hangup 在没有通话时明确失败', async () => {
+    await startWorld();
+    const hangup = world!.tools().find((t) => t.name === 'phone_hangup')!;
+    const outcome = (await hangup.handler({}, {} as never)) as { text: string; failed?: boolean };
+    expect(outcome.failed).toBe(true);
+    expect(outcome.text).toContain('没有通话');
+  });
+
+  it('phone_answer 在无来电时明确失败', async () => {
+    await startWorld();
+    const answer = world!.tools().find((t) => t.name === 'phone_answer')!;
+    const outcome = (await answer.handler({}, {} as never)) as { text: string; failed?: boolean };
+    expect(outcome.failed).toBe(true);
+  });
+
+  it('接起时的回执说清"submitted ≠ 接通"', async () => {
+    const host = await startWorld({ autoAnswer: false });
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ringing'), 4000, '响铃事件');
+    const answer = world!.tools().find((t) => t.name === 'phone_answer')!;
+    const outcome = String(await answer.handler({}, {} as never));
+    expect(outcome).toContain('submitted');
+    expect(outcome).toContain('通话中');
+  });
+
+  /**
+   * 2026-10-10 实测:她两次 phone_hangup 都失败,上游那句理由是
+   * 「Requires an exact audited QQ library…」—— 看着像"这个 QQ 版本不支持挂断",
+   * 其实是云上那个宿主正在自杀重启(通话由对方结束时它就这样),那几秒原生能力没就绪。
+   */
+  const AUDIT_REFUSAL = {
+    code: 'CAPABILITY_UNAVAILABLE',
+    message: 'Requires an exact audited QQ library, build, platform and architecture.',
+  };
+
+  it('★ 挂断第一次失败会**自动再试一次**;两次都失败就把出路说清,并带上上游的码', async () => {
+    const host = await startWorld();
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    bridge!.onRequest = (op) => (op === 'hangup' ? { ok: false, error: AUDIT_REFUSAL } : undefined);
+    const hangup = world!.tools().find((t) => t.name === 'phone_hangup')!;
+    const outcome = (await hangup.handler({}, {} as never)) as { text: string; failed?: boolean };
+    expect(outcome.failed).toBe(true);
+    // 试了两次(不是试一次就放手)
+    expect(bridge!.requests.filter((r) => r.op === 'hangup')).toHaveLength(2);
+    // 码要在里面:那条误导人的理由光看 message 认不出是什么毛病
+    expect(outcome.text).toContain('CAPABILITY_UNAVAILABLE');
+    // 出路要给她:让他挂,而不是让她自己反复试
+    expect(outcome.text).toContain('你挂一下');
+  });
+
+  it('挂断第一次失败、第二次成了:如实说是哪一次成的', async () => {
+    const host = await startWorld();
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    let attempts = 0;
+    bridge!.onRequest = (op) => {
+      if (op !== 'hangup') return undefined;
+      attempts += 1;
+      return attempts === 1 ? { ok: false, error: AUDIT_REFUSAL } : undefined; // 第二次走默认回执 = 成功
+    };
+    const hangup = world!.tools().find((t) => t.name === 'phone_hangup')!;
+    const text = String(await hangup.handler({}, {} as never));
+    expect(attempts).toBe(2);
+    expect(text).toContain('又试了一次');
+    expect(text).toContain('提交上了');
+  });
+});
+
+describe('隧道起不来时不许装死(2026-10-09 云上实测过的那件事)', () => {
+  it('ssh 一起就死:那条原因要变成一条她能看见的事件,而不是只在空气里', async () => {
+    bridge = new FakeBridge(TOKEN);
+    const url = await bridge.listen();
+    // 假 ssh:立刻吐一句错然后死掉(真事:Windows 自带 ssh 嫌私钥权限太开放)。
+    const children: Array<import('node:events').EventEmitter & { stderr: import('node:events').EventEmitter; exitCode: number | null; killed: boolean; kill(): boolean }> = [];
+    const spawnImpl = (() => {
+      const child = Object.assign(new EventEmitter(), {
+        stderr: new EventEmitter(),
+        exitCode: null as number | null,
+        killed: false,
+        kill() {
+          this.killed = true;
+          return true;
+        },
+      });
+      children.push(child);
+      setTimeout(() => {
+        child.stderr.emit('data', Buffer.from('Bad permissions. UNPROTECTED PRIVATE KEY FILE!'));
+        child.emit('close', 255);
+      }, 5);
+      return child;
+    }) as never;
+
+    const cfg: PhoneConfigSection = {
+      ...structuredClone(PHONE_DEFAULTS),
+      enabled: true,
+      bridgeUrl: url,
+      tokenSecret: 'TEST_PHONE_TOKEN',
+      callers: [HIM],
+      ssh: { ...PHONE_DEFAULTS.ssh, enabled: true, host: '203.0.113.10', keyFile: 'C:/keys/phone-tunnel-key' },
+    };
+    world = new PhoneWorld({
+      cfg,
+      timezone: 'Asia/Shanghai',
+      dataDir: scratch,
+      secret: () => TOKEN,
+      fetchImpl: fakeServices(),
+      spawnImpl,
+    });
+    const host = new FakeHost();
+    await world.start(host);
+    await waitFor(() => host.events.some((e) => e.text.includes('隧道起不来')), 4000, '隧道那条通知');
+    const notice = host.events.find((e) => e.text.includes('隧道起不来'))!;
+    expect(notice.type).toBe('phone.notice');
+    expect(notice.origin).toBe('internal');
+    expect(notice.text).toContain('UNPROTECTED PRIVATE KEY FILE');
+  });
+});
+
+describe('三处实测踩出来的规矩(2026-10-09 他打过来"被拒绝 / 打不通")', () => {
+  it('★ 已经过期的邀请**不许接** —— 接了会把桥卡住', async () => {
+    const host = await startWorld({ ringTimeoutSec: 30 });
+    // 一通躺在那里 5 分钟的"响铃"(他重启时那通 17:14 的邀请就是这样)
+    bridge!.ring('c1', String(HIM), { createdAt: Date.now() - 5 * 60_000 });
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'reject'), 6000, '拒绝命令');
+    expect(bridge!.requests.some((r) => r.op === 'accept')).toBe(false);
+    const notice = host.events.find((e) => e.text.includes('早没人等了'))!;
+    expect(notice.text).toContain('会把桥卡住');
+  });
+
+  it('★ 号码还没报上来时先等一等,别把正经来电当陌生号拒掉', async () => {
+    bridge = new FakeBridge(TOKEN);
+    const url = await bridge.listen();
+    const cfg: PhoneConfigSection = {
+      ...structuredClone(PHONE_DEFAULTS),
+      enabled: true,
+      bridgeUrl: url,
+      tokenSecret: 'TEST_PHONE_TOKEN',
+      callers: [HIM],
+      tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+    };
+    world = new PhoneWorld({ cfg, timezone: 'Asia/Shanghai', dataDir: scratch, secret: () => TOKEN, fetchImpl: fakeServices() });
+    const host = new FakeHost();
+    await world.start(host);
+    await waitFor(() => bridge!.connected, 5000, '桥连上');
+
+    // 上游的真实顺序:先一条只有 id 的(号码是 unknown),几十毫秒后才补上真号。
+    bridge.ring('c1', 'unknown');
+    await new Promise((r) => setTimeout(r, 120));
+    bridge.update('c1', { targetId: String(HIM) });
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'accept'), 6000, '接听命令');
+    expect(bridge!.requests.some((r) => r.op === 'reject')).toBe(false);
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'), 6000, '接通事件');
+  });
+
+  it('★ 学会一次映射:先只报 uid、随后补上号码 ⇒ 下一通只报 uid 也认得', async () => {
+    const UID = 'u_example000000000000000';
+    const host = await startWorld();
+    // 第一通:先 uid,再补号码 —— 这一通应该在宽限期内被接起,顺便把映射学到。
+    bridge!.ring('c1', UID);
+    await new Promise((r) => setTimeout(r, 120));
+    bridge!.update('c1', { targetId: String(HIM) });
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'accept'), 6000, '第一通接听');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'), 6000, '第一通接通');
+    bridge!.setPhase('c1', 'ended');
+
+    // 第二通:只报 uid,**不再补号码** —— 靠学到的映射也要接。
+    bridge!.ring('c2', UID);
+    await waitFor(() => bridge!.requests.filter((r) => r.op === 'accept').length >= 2, 6000, '第二通接听(靠学到的映射)');
+    expect(bridge!.requests.filter((r) => r.op === 'reject').length).toBe(0);
+  });
+
+  it('号码一直没报上来:等过头了还是按陌生号处理(不能永远不响)', async () => {
+    await startWorld({ autoAnswer: true, rejectUnknown: true });
+    bridge!.ring('c2', 'unknown');
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'reject'), 9000, '等到宽限过去后拒绝');
+    expect(bridge!.requests.some((r) => r.op === 'accept')).toBe(false);
+  });
+
+  it('★ 卡在 `ending` 上也要认出来(拒绝那一侧的卡法,上一版不认识它)', async () => {
+    const host = await startWorld({ stuckSec: 1 });
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    bridge!.setPhase('c1', 'ending');
+    await waitFor(() => host.events.some((e) => e.text.includes('卡在「ending」')), 6000, '卡在 ending 那条通知');
+    expect(host.events.find((e) => e.text.includes('卡在「ending」'))!.text).toContain('recoverCommand');
+  });
+
+  it('★ 桥卡在"还有一条命令没完成"上:连败三次就说出来(并尝试自愈)', async () => {
+    const host = await startWorld();
+    bridge!.onRequest = (op) =>
+      op === 'reject' || op === 'accept'
+        ? { ok: false, error: { code: 'BUSY', message: 'Another control is pending or the call is in the wrong phase' } }
+        : undefined;
+    // 三次陌生号 = 三次 reject 全失败。
+    for (const id of ['x1', 'x2', 'x3']) {
+      bridge!.ring(id, '999999');
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    await waitFor(() => host.events.some((e) => e.text.includes('桥卡住')), 6000, '卡住那条通知');
+    const notice = host.events.find((e) => e.text.includes('桥卡住'))!;
+    expect(notice.type).toBe('phone.notice');
+    expect(notice.text).toContain('recoverCommand');
+  });
+});
+
+describe('World 比来电晚一步也能接上(2026-10-09 栽过的那个坑)', () => {
+  it('连上时桥那边正响着一通在名单里的来电 ⇒ 照样接', async () => {
+    bridge = new FakeBridge(TOKEN);
+    const url = await bridge.listen();
+    // 先把来电摆在桥那边(**World 还没连上**,所以这条推送没人收)。
+    bridge.ring('late', String(HIM));
+    const cfg: PhoneConfigSection = {
+      ...structuredClone(PHONE_DEFAULTS),
+      enabled: true,
+      bridgeUrl: url,
+      tokenSecret: 'TEST_PHONE_TOKEN',
+      callers: [HIM],
+      tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+    };
+    world = new PhoneWorld({ cfg, timezone: 'Asia/Shanghai', dataDir: scratch, secret: () => TOKEN, fetchImpl: fakeServices() });
+    const host = new FakeHost();
+    await world.start(host);
+    // 连上时那包 `hello` 里带着这通 —— 要能认出来并接。
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'accept'), 6000, '接听命令');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'), 6000, '接通事件');
+    expect(host.events.find((e) => e.type === 'phone.connected')!.text).toContain(String(HIM));
+  });
+});
+
+describe('连不上桥时不许装死', () => {
+  it('接听名单空着:启动时就把这件事说出来(谁都打不进来是配错,不是静音)', async () => {
+    const host = await startWorld({ callers: [] });
+    const notice = host.events.find((e) => e.type === 'phone.notice' && e.text.includes('接听名单是空的'));
+    expect(notice).toBeDefined();
+    expect(notice!.text).toContain('config.json');
+  });
+
+  it('填了名单:启动时把接谁说出来', async () => {
+    const host = await startWorld();
+    expect(host.events.some((e) => e.text.includes(String(HIM)))).toBe(true);
+  });
+
+  it('没配令牌:明确说缺什么,而不是静静什么都不发生', async () => {
+    bridge = new FakeBridge(TOKEN);
+    const url = await bridge.listen();
+    const cfg: PhoneConfigSection = { ...structuredClone(PHONE_DEFAULTS), enabled: true, bridgeUrl: url, tokenSecret: 'MISSING' };
+    world = new PhoneWorld({ cfg, timezone: 'Asia/Shanghai', dataDir: scratch, secret: () => '', fetchImpl: fakeServices() });
+    const host = new FakeHost();
+    await world.start(host);
+    expect(host.events.some((e) => e.text.includes('没拿到桥的令牌'))).toBe(true);
+    expect(host.events[0]!.origin).toBe('internal');
+  });
+});
+
+describe('她主动拨给他(phone_dial)', () => {
+  const ME = 'u_example000000000000000';
+  const dial = () => world!.tools().find((t) => t.name === 'phone_dial')!;
+  /**
+   * 真桥在 dial 之后会把这一通当 `outgoing` 推回来(守护进程先 ingest 再回执),
+   * 而且**接通是异步的**:先 `dialing`,他真接了才是 `connected`。
+   * `connect: false` 就是"拨出去了、但他没接"那条路。
+   */
+  const answerDialWithCall = (callId: string, connect = true): void => {
+    bridge!.onRequest = (op, args) => {
+      if (op === 'dial') {
+        bridge!.ring(callId, String(args.targetId), { direction: 'outgoing', state: 'dialing' });
+        if (connect) setTimeout(() => bridge!.setPhase(callId, 'connected'), 10);
+      }
+      return undefined;
+    };
+  };
+
+  it('没配拨号目标:明确说拨不出去,一个命令都不发', async () => {
+    await startWorld(); // 默认 dial.target = ''
+    const outcome = (await dial().handler({}, {} as never)) as { text: string; failed?: boolean };
+    expect(outcome.failed).toBe(true);
+    expect(outcome.text).toContain('没配拨号目标');
+    expect(bridge!.requests.some((r) => r.op === 'dial')).toBe(false);
+  });
+
+  it('配了目标:按上游那条帧发出去 —— 目标是 uid、media 是 audio', async () => {
+    await startWorld({ dial: { target: ME, label: '他' } });
+    const text = String(await dial().handler({}, {} as never));
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'dial'), 4000, '拨号命令');
+    expect(bridge!.requests.find((r) => r.op === 'dial')!.args).toMatchObject({
+      kind: 'direct',
+      targetId: ME,
+      media: 'audio',
+    });
+    expect(text).toContain('他');
+    // 回执必须保持"命令交出去了 ≠ 接通了"那个口径(与接听一样)。
+    expect(text).toContain('submitted');
+  });
+
+  it('通话中不能拨:本地先拦下,不把上游那句英文错误抛给她', async () => {
+    const host = await startWorld({ dial: { target: ME, label: '他' } });
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    const outcome = (await dial().handler({}, {} as never)) as { text: string; failed?: boolean };
+    expect(outcome.failed).toBe(true);
+    expect(outcome.text).toContain('不能同时拨');
+    expect(bridge!.requests.some((r) => r.op === 'dial')).toBe(false);
+  });
+
+  it('桥没连着:也说清楚,不是静默失败', async () => {
+    world = new PhoneWorld({
+      cfg: {
+        ...structuredClone(PHONE_DEFAULTS),
+        enabled: true,
+        // 指一个没人听的口:桥这一路永远连不上。
+        bridgeUrl: 'ws://127.0.0.1:1/v1/stream',
+        tokenSecret: 'TEST_PHONE_TOKEN',
+        callers: [HIM],
+        dial: { target: ME, label: '他' },
+      },
+      timezone: 'Asia/Shanghai',
+      dataDir: scratch,
+      secret: () => TOKEN,
+      fetchImpl: fakeServices(),
+    });
+    await world.start(new FakeHost());
+    const outcome = (await world.tools().find((t) => t.name === 'phone_dial')!.handler({}, {} as never)) as {
+      text: string;
+      failed?: boolean;
+    };
+    expect(outcome.failed).toBe(true);
+    expect(outcome.text).toContain('桥没连着');
+  });
+
+  it('★ 她拨的那通他接了:事件说"拨出",通话本身照常跑', async () => {
+    const host = await startWorld({ dial: { target: ME, label: '他' } });
+    answerDialWithCall('out1');
+    await dial().handler({}, {} as never);
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'), 6000, '接通事件');
+    const connected = host.events.find((e) => e.type === 'phone.connected')!;
+    expect(connected.text).toContain('拨出');
+    expect(connected.text).toContain(ME);
+    expect(host.events.some((e) => e.type === 'phone.outgoingFailed')).toBe(false);
+  });
+
+  it('★ 她拨的那通从头到尾没接通:必须说一声(不然她会以为打成了)', async () => {
+    const host = await startWorld({ dial: { target: ME, label: '他' } });
+    answerDialWithCall('out2', false);
+    await dial().handler({}, {} as never);
+    await waitFor(() => bridge!.calls.get('out2') !== undefined, 4000, '那通出现');
+    bridge!.setPhase('out2', 'ended');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.outgoingFailed'), 6000, '没接通那条');
+    const failed = host.events.find((e) => e.type === 'phone.outgoingFailed')!;
+    expect(failed.text).toContain('没接通');
+    expect(failed.text).toContain('phone_dial');
+    // 没接通就没有"通话结束"那条(她压根没进过这一通)。
+    expect(host.events.some((e) => e.type === 'phone.ended')).toBe(false);
+  });
+});
+
+describe('通话记录:挂断时把两边说过的话打包给她', () => {
+  it('★ 他说的与她真正念出去的都在 phone.ended 正文里', async () => {
+    const host = await startWorld({}, fakeServices({ asrText: '你吃饭了吗' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    await feedSpeech('c1');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.speech'), 8000, '她听到的一句');
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '吃了，你呢。' } as never);
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.write'), 8000, '她的声音发出去');
+    bridge!.setPhase('c1', 'ended');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ended'), 6000, '收尾事件');
+    const ended = host.events.find((e) => e.type === 'phone.ended')!;
+    expect(ended.text).toContain('这一通的记录');
+    expect(ended.text).toContain('他：你吃饭了吗');
+    expect(ended.text).toContain('她：吃了，你呢。');
+  });
+
+  it('没念出去的话不进记录 —— 记录是"他真听到的",不是"她写了什么"', async () => {
+    const host = await startWorld({ maxSpeakSec: 1 }, fakeServices({ herSpeech: tone(1200, 32000, 520) }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    // 第一句就把这一轮的额度用掉,第二句会被那道闸门拦在门外、一个字都不会念出去。
+    world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '第一句我多说几个字。第二句应该被拦下。' } as never);
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.write'), 8000, '第一句出声');
+    await new Promise((r) => setTimeout(r, 500));
+    bridge!.setPhase('c1', 'ended');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ended'), 6000, '收尾事件');
+    const ended = host.events.find((e) => e.type === 'phone.ended')!;
+    expect(ended.text).toContain('第一句我多说几个字');
+    expect(ended.text).not.toContain('第二句应该被拦下');
+  });
+
+  it('一句都没说过的一通:不挂一个空的记录壳', async () => {
+    const host = await startWorld();
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    bridge!.setPhase('c1', 'ended');
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ended'), 6000, '收尾事件');
+    expect(host.events.find((e) => e.type === 'phone.ended')!.text).not.toContain('这一通的记录');
+  });
+});
+
+describe('耳朵那两条:猜错的语言 / 他一直没被听见', () => {
+  it('★ 碎片段被猜成日文:不投给她,而是当成"没听清"', async () => {
+    const host = await startWorld({}, fakeServices({ asrText: 'やて。' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    await feedSpeech('c1', 2000);
+    await waitFor(() => host.events.some((e) => e.type === 'phone.speech'), 8000, '一句');
+    const speech = host.events.find((e) => e.type === 'phone.speech')!;
+    expect(speech.text).toContain('没听清');
+    expect(speech.text).not.toContain('やて');
+  });
+
+  it('配成中文之后:一个汉字都没有的正文也算"没听清"', async () => {
+    const host = await startWorld({ asr: { ...PHONE_DEFAULTS.asr, language: 'zh' } }, fakeServices({ asrText: 'Yeah.' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    await feedSpeech('c1', 2000);
+    await waitFor(() => host.events.some((e) => e.type === 'phone.speech'), 8000, '一句');
+    expect(host.events.find((e) => e.type === 'phone.speech')!.text).toContain('没听清');
+  });
+
+  it('auto 下的英文短词**不误杀** —— 那可能就是他真说的', async () => {
+    const host = await startWorld({}, fakeServices({ asrText: 'OK' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    await feedSpeech('c1', 1200);
+    await waitFor(() => host.events.some((e) => e.type === 'phone.speech'), 8000, '一句');
+    const speech = host.events.find((e) => e.type === 'phone.speech')!;
+    expect(speech.text).toContain('OK');
+    expect(speech.text).not.toContain('没听清');
+  });
+
+  it('★ 连着三段一个字都没认出来:明说"他这一通几乎没被听见",而且只说一次', async () => {
+    const host = await startWorld({}, fakeServices({ asrText: '' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    for (let i = 0; i < 3; i += 1) await feedSpeech('c1', 2000);
+    await waitFor(
+      () => host.events.some((e) => e.type === 'phone.notice' && e.text.includes('没认出来')),
+      10000,
+      '那一句提醒',
+    );
+    const notes = host.events.filter((e) => e.type === 'phone.notice' && e.text.includes('没认出来'));
+    expect(notes).toHaveLength(1);
+    // 要给她**可行动**的出路,不能只说"听不见"。
+    expect(notes[0]!.text).toContain('打字');
+    expect(notes[0]!.origin).toBe('internal');
+    // 再来一段也不会说第二遍(一通只说一次)。
+    await feedSpeech('c1', 2000);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(host.events.filter((e) => e.type === 'phone.notice' && e.text.includes('没认出来'))).toHaveLength(1);
+  });
+
+  it('认出来一句就把那一串清零:三段的门槛不会被"两段 + 一句"凑出来', async () => {
+    const host = await startWorld({}, fakeServices({ asrText: '' }));
+    bridge!.ring('c1', String(HIM));
+    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    await feedSpeech('c1', 2000);
+    await feedSpeech('c1', 2000);
+    expect(host.events.some((e) => e.text.includes('没认出来'))).toBe(false);
+  });
+});

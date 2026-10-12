@@ -1,0 +1,20 @@
+{
+  "host": "127.0.0.1",
+  "port": 6120,
+  "tokenFile": "/work/test/bridge/runtime/control.token",
+  "account": { "selfId": "10001", "platform": "qq" },
+  "qq": {
+    "url": "http://127.0.0.1:6110",
+    "tokenFile": "/work/test/bridge/runtime/control.token",
+    "selfId": "10001"
+  },
+  "audio": {
+    "backend": "pulse",
+    "sampleRate": 48000,
+    "channels": 2,
+    "frameMs": 20,
+    "inputDevice": "koishi_rtc_qq_speaker.monitor",
+    "outputDevice": "koishi_rtc_qq_mic",
+    "pulseServer": "unix:/work/test/bridge/runtime/pulse/native"
+  }
+}

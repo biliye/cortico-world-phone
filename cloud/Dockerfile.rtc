@@ -1,0 +1,112 @@
+# 派生镜像:路 A1 —— 生产那份容器 + 电话那套的运行时地基
+#
+# 它 = 官方 napcat 镜像 + 四件事:
+#   1) apt 源换阿里云(这台 ECS 没有 IPv6,不换会卡死)
+#   2) 桥的运行时依赖(pulseaudio / gcc / AVSDK 缺的那几个库)
+#   3) Node 22(桥的守护进程要求 >= 22.19;Ubuntu 22.04 的 apt 只给 12.x)
+#   4) 把 RTC 的启动钩子接进官方 entrypoint(在 QQ 起来**之前**装好桥)
+#
+# ★ 审计版 QQ **烤进镜像**(构建上下文里的 qq/ -> /opt/QQ)。它不挂宿主目录是有原因的:
+#   桥要改 QQ 的加载器(/opt/QQ/resources/app/loadNapCat.js)+ 改 NapCat 的 napcat.mjs,
+#   这两处必须在同一次容器生命里成套出现/成套消失 —— 一半持久一半不持久会让"重装"变成报错。
+#   所以:QQ 与 NapCat 都随容器走(重建容器就从镜像重来一遍,安装脚本幂等),
+#   只有**要留住的东西**(令牌、AV Host 登录态、日志)挂宿主。
+#   ⇒ 换 QQ 版本 = 换构建上下文里的 qq/ + 重打这个镜像(与"重审计"本来就是同一步)。
+#
+# 基础与生产**同一个镜像**:它自带 Xvfb 与 QQ 的 X11 依赖库。
+
+FROM mlikiowa/napcat-docker:latest
+
+# 1) apt 源换阿里云
+RUN set -eux; \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
+    grep -c 'mirrors.aliyun.com' /etc/apt/sources.list
+
+# 2) 容器里的 linuxqq 自己缺 xdg-utils,导致整个 apt 处于依赖不满足状态 ⇒ 先单独装它。
+#    永远不要用 apt-get -f install(可能把 linuxqq 卸掉)。
+RUN set -eux; \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends xdg-utils; \
+    rm -rf /var/lib/apt/lists/*
+
+# 3) 桥的运行时依赖
+#    pulseaudio/pactl/parec/pacat          -> 桥自起的隔离音频服务
+#    gcc + libc6-dev                       -> 在目标机上现场编译 qq-pulse-guard.so
+#    libpulse-mainloop-glib0/libegl1/libopengl0 -> AVSDK 自己 ldd 报缺的那三个
+RUN set -eux; \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+        pulseaudio pulseaudio-utils \
+        gcc libc6-dev \
+        libpulse-mainloop-glib0 libegl1 libopengl0 \
+        x11-utils xdotool netpbm x11-apps xz-utils \
+        ca-certificates curl; \
+    rm -rf /var/lib/apt/lists/*
+
+# 4) Node 22
+RUN set -eux; \
+    curl -fsSL -o /tmp/node.tar.xz https://registry.npmmirror.com/-/binary/node/latest-v22.x/node-v22.20.0-linux-x64.tar.xz; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+        --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md; \
+    rm -f /tmp/node.tar.xz; \
+    node -v; npm -v
+
+# 5) 把 NapCat 解出来(照官方 entrypoint 的做法),再把 RTC 的启动钩子插进 entrypoint。
+#    插的位置很要紧:**在 QQ 起来之前** —— 桥要改 napcat.mjs,QQ 一启动就把它读进去了。
+#    锚点找不到就让构建失败(说明上游 entrypoint 换了形状,得人来重新看一眼)。
+RUN set -eux; \
+    cd /app; \
+    mkdir -p napcat; \
+    if [ ! -f napcat/napcat.mjs ]; then \
+      unzip -q NapCat.Shell.zip -d ./NapCat.Shell; \
+      cp -rf NapCat.Shell/* napcat/; \
+      rm -rf ./NapCat.Shell; \
+    fi; \
+    ls napcat/napcat.mjs
+RUN set -eux; python3 - <<'PY'
+import pathlib
+src = pathlib.Path('/app/entrypoint.sh')
+text = src.read_text()
+anchor = 'export FFMPEG_PATH=/usr/bin/ffmpeg'
+if text.count(anchor) != 1:
+    raise SystemExit('上游 entrypoint 的形状变了:锚点 `%s` 不是唯一的,拒绝打补丁' % anchor)
+hook = (
+    '# --- Cortico 电话(路 A1):在 QQ 起来之前把 RTC 那套装好并起起来 ---\n'
+    'if [ -f /opt/rtc-src/boot-rtc.sh ]; then\n'
+    '    bash /opt/rtc-src/boot-rtc.sh prep \\\n'
+    '      || echo "[rtc] 准备失败 —— QQ 照常起,但电话这一路会不可用(看 /opt/rtc/logs/)"\n'
+    'fi\n'
+)
+pathlib.Path('/app/entrypoint.rtc.sh').write_text(text.replace(anchor, hook + anchor))
+print('entrypoint 已打补丁 -> /app/entrypoint.rtc.sh')
+PY
+
+# 6) ★ 把 QQ 换成审计过的那一版(桥的原生能力是**按这个 build 的库哈希**审计的;
+#    换成一版没审计的就整片 unavailable)。放最后:前面几步还要 apt,而这一步之后 dpkg
+#    的 linuxqq 记录与 /opt/QQ 就对不上了 —— 之后不要再跑 apt。
+#    审计钉的 x64 库哈希:c143c4e8ac94c20bcefb037e7062fbeccd0528bd746108d6bf1f0ae8e1710a8b
+COPY qq/ /opt/QQ.new/
+RUN set -eux; \
+    actual=$(sha256sum /opt/QQ.new/resources/app/avsdk/libAVSDKPlugin.so | cut -d' ' -f1); \
+    expected=c143c4e8ac94c20bcefb037e7062fbeccd0528bd746108d6bf1f0ae8e1710a8b; \
+    if [ "$actual" != "$expected" ]; then \
+      echo "!! 上下文里的 QQ 不是桥审计过的那一版(libAVSDKPlugin.so=$actual)"; exit 1; \
+    fi; \
+    rm -rf /opt/QQ; mv /opt/QQ.new /opt/QQ; \
+    python3 -c "import json;print('QQ 版本 =',json.load(open('/opt/QQ/resources/app/package.json'))['version'])"
+
+# 7) 审计版 QQ 是**裸 deb 解包**,还缺 NapCat 的加载器 —— 照官方镜像的做法补上两处:
+#    resources/app/loadNapCat.js 指向 /app/napcat/napcat.mjs,package.json 的 main 指向它。
+#    (install.py 的 media 模式会检查 main 必须正是这个值;少了这一步它会直接拒绝安装。)
+RUN set -eux; \
+    app=/opt/QQ/resources/app; \
+    echo '(async () => {await import("file:///app/napcat/napcat.mjs");})();' > "$app/loadNapCat.js"; \
+    sed -i 's|"main": "[^"]*"|"main": "./loadNapCat.js"|' "$app/package.json"; \
+    python3 -c "import json;d=json.load(open('$app/package.json'));assert d['main']=='./loadNapCat.js', d['main'];print('main 已指向 loadNapCat.js')"; \
+    ls -la "$app/loadNapCat.js"
+
+# CMD 清空:不要给 entrypoint 塞多余的位置参数
+CMD []
+
+# 与官方同一个工作目录(entrypoint 里用的是相对路径)
+ENTRYPOINT ["bash", "entrypoint.rtc.sh"]
