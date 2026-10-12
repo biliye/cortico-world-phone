@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-## 依赖的第三方(都不在本仓库里,只是运行时对端)
-
-- 协议端那套桥是第三方项目(GPL-3.0):本仓库**一行代码都不抄**,只按它公开的
-  WebSocket 协议 / 界面驱动方式跟它说话。部署时由使用者自己按它的许可安装。
-- `cloud/sl-bridge.mjs` 是**我们自己的实现**(复刻那份协议),不是上游代码的拷贝。
-- 运行时唯一的 npm 依赖是 `ws`(MIT)。

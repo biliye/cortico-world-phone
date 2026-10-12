@@ -32,7 +32,8 @@
     "probes",
     "AGENTS.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY.md"
   ],
   "scripts": {
     "test": "vitest run",
