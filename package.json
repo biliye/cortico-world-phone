@@ -9,6 +9,10 @@
     "url": "https://github.com/biliye/cortico-world-phone.git"
   },
   "homepage": "https://github.com/biliye/cortico-world-phone#readme",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "keywords": [
     "cortico-world",
     "cortico",
@@ -40,7 +44,8 @@
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
     "ttscheck": "tsx scripts/tts-check.ts",
-    "bridgeprobe": "tsx scripts/bridge-probe.ts"
+    "bridgeprobe": "tsx scripts/bridge-probe.ts",
+    "prepublishOnly": "npm run typecheck && npm run test"
   },
   "dependencies": {
     "ws": "^8.18.0"
