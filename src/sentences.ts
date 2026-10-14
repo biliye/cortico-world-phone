@@ -100,6 +100,18 @@ export function flushSentence(buffer: string): string | null {
 }
 
 /**
+ * 一句话的"是不是同一句"指纹(去重用)。
+ *
+ * 为什么需要:她那一侧出声有**两条路** —— 调 `phone_say`、或者直接写下正文(这一路会念它)。
+ * 两条都通,所以她完全可能把同一句既写进正文又塞进工具参数,而不去重他那边就会**听两遍**。
+ * 只抹掉空白与句末标点(先过一遍 `speakable`,把 markdown/emoji 那层也归一),
+ * **话本身一个字不动**。
+ */
+export function speechKey(text: string): string {
+  return speakable(text).replace(/\s+/g, '').replace(/[。！？!?…；;，,、.]+$/u, '');
+}
+
+/**
  * 这段话值不值得合成。
  *
  * 一个字母、数字、汉字都没有的东西(纯标点、纯记号)不值得花钱去念 ——

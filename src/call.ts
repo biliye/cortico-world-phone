@@ -110,12 +110,24 @@ export function stuckFor(call: BridgeCall, policy: CallPolicy, sinceMs: number, 
   return held >= policy.stuckSec * 1000 ? held : null;
 }
 
-/** 接起这一句,给事件正文用。 */
+/**
+ * 接起这一句,给事件正文用。
+ *
+ * **除了"他说的会变成事件",这一句还必须说清"你从哪儿出声"。**
+ * 2026-10-14 实测:三通电话她每轮都只调 `end_turn`、一个字不写 —— 因为框架那条常驻规矩
+ * (「不经工具写的正文是内心活动,要说话得用说话工具」)压过了"正文会被念出去"这件事,
+ * 而这一段通知当时只讲了入站方向。于是接通这一条成了"她第一次能开口"的现场提示,
+ * 出声的两条路都在这一句里点明。
+ */
 export function describeConnected(call: BridgeCall): string {
   const who = callerOf(call) || '没报出号';
   const how = call.direction === 'outgoing' ? '拨出' : '来电';
   const media = call.media ? `,${call.media === 'video' ? '视频' : '语音'}` : '';
-  return `【电话】${how}接通了:${who}${media}。现在开始,他说的每一句都会作为事件给你。`;
+  return (
+    `【电话】${how}接通了:${who}${media}。现在开始,他说的每一句都会作为事件给你。` +
+    '你要说话就调 `phone_say`(直接写下的正文这一路也会被念出去)——' +
+    '**别沉默**:你什么都不说,他那头就是一段静音,他分不出你是"不用回"还是"没听见"。'
+  );
 }
 
 /** 通话记录里的一行。`him` = 对方说的(识别出来的正文),`her` = 她真正念出去的句子。 */

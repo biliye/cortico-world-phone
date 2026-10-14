@@ -11,8 +11,10 @@
 1. **包装进部署的 `extensions/`** —— 控制台「扩展」页选本机目录,或
    `cd extensions && corepack pnpm add --ignore-workspace <这个目录>`。
    它有一个运行时依赖 `ws`:桥的握手要求 `Authorization` 头,而 Node 自带的 WebSocket 设不了头。
-2. **重启进程**。她会多出 `phone_answer` / `phone_dial` / `phone_hangup` / `phone_status` /
-   `phone_stop` 五个工具;系统前缀里多出"电话"那一段(下一轮前缀重建时生效)。
+2. **重启进程**。她会多出 `phone_say` / `phone_answer` / `phone_dial` / `phone_hangup` / `phone_status` /
+   `phone_stop` 六个工具;系统前缀里多出"电话"那一段(下一轮前缀重建时生效)。
+   **通话中开口走 `phone_say`**(她写下的正文也会被念出去,但别只指望那一条 —— 理由见
+   `field-notes.md` §5.5)。
 3. **部署的 `.env` 里给两样东西**:
    - `PHONE_BRIDGE_TOKEN=<桥的令牌>`(变量名可改,见 `tokenSecret`);
    - `<TTS 服务商的密钥>`(嗓子;若与别的 World 共用已经有了就不必再写)。

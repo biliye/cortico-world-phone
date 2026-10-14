@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { billableChars, flushSentence, speakable, takeSentences, worthSpeaking } from '../src/sentences.ts';
+import { billableChars, flushSentence, speakable, speechKey, takeSentences, worthSpeaking } from '../src/sentences.ts';
 
 describe('speakable:删掉的是排版记号,不是她的话', () => {
   it('围栏代码块整块不留', () => {
@@ -82,6 +82,22 @@ describe('flushSentence 与 worthSpeaking', () => {
     expect(worthSpeaking('123')).toBe(true);
     expect(worthSpeaking('……')).toBe(false);
     expect(worthSpeaking('，。！')).toBe(false);
+  });
+});
+
+describe('speechKey:一轮里去重用的"是不是同一句"', () => {
+  it('抹掉空白与句末标点之后相等,就是同一句', () => {
+    expect(speechKey('我在呢。')).toBe(speechKey('我在呢'));
+    expect(speechKey('  我在呢。 ')).toBe(speechKey('我在呢!'));
+  });
+
+  it('也过一遍排版记号那一层(她的正文里常带 markdown / emoji)', () => {
+    expect(speechKey('**我在呢。**')).toBe(speechKey('我在呢。'));
+    expect(speechKey('我在呢😊。')).toBe(speechKey('我在呢。'));
+  });
+
+  it('话不一样就是不一样(只删记号,不改话)', () => {
+    expect(speechKey('我在呢。')).not.toBe(speechKey('我不在。'));
   });
 });
 

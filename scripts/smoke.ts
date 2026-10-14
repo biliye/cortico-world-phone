@@ -113,7 +113,7 @@ async function main(): Promise<void> {
   console.log(`电话 World 冒烟（识别=${realAsr ? '本机真服务' : '假'}，嗓子=假，话机=假桥）\n`);
   await world.start(host);
   await waitFor(() => bridge.connected, 5000, '桥连上');
-  check('桥连上、工具就位', world.tools().length === 5, `工具 ${world.tools().map((t) => t.name).join(' / ')}`);
+  check('桥连上、工具就位', world.tools().length === 6, `工具 ${world.tools().map((t) => t.name).join(' / ')}`);
 
   // ① 白名单来电 → 自动接起 → 接通事件
   bridge.ring('c1', String(HIM));
@@ -143,6 +143,14 @@ async function main(): Promise<void> {
     frame.encoding === 'pcm_s16le' && frame.sampleRate === 48000 && frame.channels === 2 && pcm.length % 4 === 0,
     `${pcm.length} 字节/帧,${frame.sampleRate}Hz ${String(frame.channels)}ch`,
   );
+
+  // ③b 她调 phone_say 说话:这是 2026-10-14 补的那条出声通道(那条常驻规矩要的"说话工具")
+  const sayTool = world.tools().find((t) => t.name === 'phone_say')!;
+  const sayBefore = bridge.requests.filter((r) => r.op === 'audio.write').length;
+  const sayOut = await sayTool.handler({ text: '嗯,我在。' }, {} as never);
+  const sayText = typeof sayOut === 'string' ? sayOut : sayOut.text;
+  await waitFor(() => bridge.requests.filter((r) => r.op === 'audio.write').length > sayBefore, 10000, 'phone_say 的音频');
+  check('她调 phone_say 说的那句也发回桥了', sayText.includes('我在'), sayText.slice(0, 50));
 
   // ④ 对方插嘴 → 清掉没放完的音频
   bridge.pushAudioFrame('c1', stereo(silence(300, 48000, 30)));

@@ -45,7 +45,7 @@ import {
 } from './call.ts';
 import { Segmenter, frameDb, hasWords, looksLikeWrongLanguage, transcribe } from './ear.ts';
 import { downmixToMono, durationMs, pcmToWav, resampleMono, sliceFrames, toChannels } from './pcm.ts';
-import { flushSentence, takeSentences, worthSpeaking } from './sentences.ts';
+import { flushSentence, speechKey, takeSentences, worthSpeaking } from './sentences.ts';
 import { SshTunnel } from './ssh.ts';
 import { synthesizePcm } from './tts.ts';
 import { clock, describe, humanSeconds, sleep, type VoiceLoggerLike } from './util.ts';
@@ -250,6 +250,14 @@ export class PhoneWorld implements World {
    * 下一轮(`response.created`)自己解开 —— 她要接着说话，随时可以说。
    */
   private roundMuted = false;
+  /**
+   * **这一轮**里已经交出去的句子(正文那条路与 `phone_say` 都记在这儿)。
+   *
+   * 为什么要有它:她出声有两条路(直接写正文 / 调 `phone_say`),两条都通,所以完全可能
+   * 把同一句既写进正文又塞进工具参数 —— 不去重,他那边就听两遍。
+   * 粒度是**一轮**:下一轮她再说同一句是她的本意,照念。
+   */
+  private saidThisRound = new Set<string>();
 
   private bridgeRate = BRIDGE_RATE;
   private bridgeChannels = BRIDGE_CHANNELS;
@@ -280,7 +288,7 @@ export class PhoneWorld implements World {
   }
 
   tools(): ToolDef[] {
-    return [this.answerTool(), this.dialTool(), this.hangupTool(), this.statusTool(), this.stopTool()];
+    return [this.sayTool(), this.answerTool(), this.dialTool(), this.hangupTool(), this.statusTool(), this.stopTool()];
   }
 
   /**
@@ -625,6 +633,7 @@ export class PhoneWorld implements World {
     this.audioQueue = [];
     this.plannedSpeechMs = 0;
     this.roundCapNoted = false;
+    this.saidThisRound.clear();
     this.bargeRunMs = 0;
     this.bargeOnsetHerActive = false;
     this.bargeLoud = false;
@@ -664,6 +673,7 @@ export class PhoneWorld implements World {
     this.speakBuffer = '';
     this.speakQueue = [];
     this.audioQueue = [];
+    this.saidThisRound.clear();
     this.bargeRunMs = 0;
     this.bargeOnsetHerActive = false;
     this.bargeLoud = false;
@@ -921,6 +931,8 @@ export class PhoneWorld implements World {
       // 这条闸门是**每一轮**的额度(不是整通电话的)—— 见 config 里 maxSpeakSec 的说明。
       this.plannedSpeechMs = 0;
       this.roundCapNoted = false;
+      // 去重也是**每一轮**的:新一轮里同一句话照念(她可能是真要再说一遍)。
+      this.saidThisRound.clear();
       // 上一轮她按过停 —— 那是"这一轮"的事,新一轮照常能说。
       this.roundMuted = false;
       return;
@@ -940,7 +952,11 @@ export class PhoneWorld implements World {
     }
     const tail = flushSentence(this.speakBuffer);
     this.speakBuffer = '';
-    if (tail && worthSpeaking(tail)) this.enqueue([tail]);
+    // 尾巴也要过一遍去重:她写半句不带句号(一直留在缓冲里)、又用 `phone_say` 说同一句时,
+    // 漏了这一道就会把同一句念两遍 —— 2026-10-14 补 `phone_say` 时正是从这个缝里漏进来的。
+    if (tail && worthSpeaking(tail) && !this.saidThisRound.has(speechKey(tail))) {
+      this.enqueue([tail]);
+    }
   }
 
   private feedHerText(delta: string): void {
@@ -958,12 +974,24 @@ export class PhoneWorld implements World {
         text: sentences.filter((s) => !worthSpeaking(s)).join(' ').slice(0, 40),
       });
     }
-    if (usable.length > 0) this.enqueue(usable);
+    // 这一轮里 `phone_say` 已经交过的句子,这里不再念第二遍(两条路说同一句只出一声)。
+    const fresh = usable.filter((s) => !this.saidThisRound.has(speechKey(s)));
+    if (fresh.length < usable.length) {
+      this.log.info?.('这一轮里重复的句子不念第二遍', { skipped: usable.length - fresh.length });
+    }
+    if (fresh.length > 0) this.enqueue(fresh);
   }
 
-  private enqueue(sentences: string[]): void {
+  /**
+   * 把句子排进合成链。返回**实际进去几段**、以及有没有被"这一轮说够了"那道闸门挡下 ——
+   * `phone_say` 要照着这个数给她回执(挡下的没到他耳朵里,不能说成念了)。
+   */
+  private enqueue(sentences: string[]): { queued: number; capped: boolean } {
+    let queued = 0;
+    let capped = false;
     for (const sentence of sentences) {
       if (this.opts.cfg.maxSpeakSec > 0 && this.plannedSpeechMs > this.opts.cfg.maxSpeakSec * 1000) {
+        capped = true;
         if (!this.roundCapNoted) {
           this.roundCapNoted = true;
           this.log.info?.('这一轮她说的已经够长了，剩下的不念了', { spokeMs: Math.round(this.plannedSpeechMs) });
@@ -971,12 +999,15 @@ export class PhoneWorld implements World {
         continue;
       }
       this.speakQueue.push(sentence);
+      this.saidThisRound.add(speechKey(sentence));
       // 粗估:一个汉字约 0.18 秒。只为把"这一轮说够了"这条闸门算出来，
       // 不参与任何音频计算 —— 真正的时长以合成结果为准。
       this.plannedSpeechMs += sentence.length * 180;
+      queued += 1;
     }
     this.pumpSynthesis();
     this.pumpWriter();
+    return { queued, capped };
   }
 
   /** 合成走一条链:一句接一句。播放侧独立排空，所以两句之间不会因为等合成而空一拍。 */
@@ -1210,6 +1241,101 @@ export class PhoneWorld implements World {
 
   // ───────────────────────── 工具 ─────────────────────────
 
+  /**
+   * 她主动说一句(`phone_say`)。
+   *
+   * **为什么要这个工具(2026-10-14 定的)。** 这一包以前只有一条出声的路:**她写下的正文**。
+   * 而框架给她的常驻规矩是「Text you output directly, without a tool, is private thought…
+   * To be heard, use a speaking tool」(不经工具写的正文是内心活动,要说话得用说话工具),
+   * 而 qq2 / pet / terminal 都各有自己的说话工具,**只有电话没有** ——
+   * 于是"电话要出声就得写正文"这件事一直跟那条规矩正面对撞。那天实测了三通:
+   * 她每轮都只调 `end_turn`、一个字不写,他那边整通静音(而她的思考链里写着
+   * "in a call, my written text in a turn IS my voice. I should just write!")。
+   * 补上这个工具,那条规矩在电话上就成立了 —— 说话是一个**动作**,不再靠她记住例外。
+   *
+   * 正文那条路**保留不动**(兼容改写之前的用法),两条路说同一句不会念两遍(见 `saidThisRound`)。
+   *
+   * 四条边界写死在代码里,不靠她记:没接通时说出去没人听(回执明说"这一句没有被念出去")、
+   * 她自己按过停的这一轮不再出声(`roundMuted`)、一轮的额度照旧管着(`maxSpeakSec`,
+   * 被挡下的如实告诉她"他没听到")、纯记号(只有 emoji/标点)不值得花钱念。
+   *
+   * 回执只说**交给合成了** —— 合成是异步的,失败会另发一条通知(`pumpSynthesis` 那条),
+   * 与那一路上"submitted ≠ 接通"的口径一致:不把"交出去"说成"他听见了"。
+   */
+  private sayTool(): ToolDef {
+    return {
+      name: 'phone_say',
+      description:
+        '**在通话里说一句话给他听**(你那句话会被念出来)。通话中要开口就用它:说一句调一次,' +
+        '想多说就分几次调。这是说话,不是通知 —— 调一次他就真听见一句。' +
+        '现在没有接通的话时会明确告诉你"这一句没有被念出去"。',
+      tags: ['speak'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          text: {
+            type: 'string',
+            description: '要说给他听的这句话本身。短句最好 —— 一个人张口就是一句,别一次塞一整段。',
+          },
+        },
+        required: ['text'],
+      },
+      handler: async (args): Promise<string | ToolOutcome> => {
+        const call = this.current;
+        if (!call || call.phase !== 'connected') {
+          // 最常见的一种:她刚调过 phone_dial,那头还没接起来。这一条必须说死,
+          // 否则她会以为"我说过了"而其实一个字都没出去。
+          const live = describeLive(call, this.now(), this.bridgeOnline ? '' : this.bridgeNote);
+          return {
+            text:
+              `现在没有接通的话,**这一句没有被念出去**(${live})。` +
+              (call ? '等它变成"通话中"再调,或者先调 phone_answer 接起来。' : '要打给他就先调 phone_dial。'),
+            failed: true,
+          };
+        }
+        const raw = typeof args.text === 'string' ? args.text : '';
+        if (raw.trim() === '') return { text: 'text 是空的,这一句没念。', failed: true };
+        if (this.roundMuted) {
+          return {
+            text:
+              '这一轮你刚调过 phone_stop,这一轮剩下的不再出声。要接着说就等他再开口 —— 那是新一轮,那时照常能说。',
+            failed: true,
+          };
+        }
+
+        // 与正文那条路同一套切句/过滤:长句照切,尾巴也交出去(她没写句号的那半句照样念)。
+        const { sentences, rest } = takeSentences(raw, 120);
+        const tail = flushSentence(rest);
+        const all = [...sentences, ...(tail === null ? [] : [tail])].filter(worthSpeaking);
+        if (all.length === 0) {
+          return { text: '这一句里没有能念的字(只有记号或表情),他那头听不到任何东西。', failed: true };
+        }
+        const fresh = all.filter((s) => !this.saidThisRound.has(speechKey(s)));
+        if (fresh.length === 0) {
+          return `这一句这一轮已经说过了,不念第二遍:「${all[0]}」。`;
+        }
+
+        const { queued, capped } = this.enqueue(fresh);
+        if (queued === 0) {
+          return {
+            text:
+              `**没念出去**:这一轮你说的话已经够长了(worlds.phone.maxSpeakSec 管着,现在 ${this.opts.cfg.maxSpeakSec} 秒)。` +
+              '想接着说就等他再开口 —— 那是新一轮。',
+            failed: true,
+          };
+        }
+        const est = Math.round((fresh.slice(0, queued).reduce((n, s) => n + s.length, 0) * 180) / 1000);
+        const parts = [`已经交给合成念了:「${fresh[0]}」`];
+        if (queued > 1) parts.push(`(这一句被切成 ${queued} 段,一起念出去)`);
+        parts.push(`,念完大约 ${est} 秒。`);
+        if (capped) parts.push('**后面那几段被"这一轮说够了"挡下了,他没听到** —— 想接着说等他再开口。');
+        parts.push('合成要是没成,我会单独告诉你一句。');
+        return parts.join('');
+      },
+    };
+  }
+
   private answerTool(): ToolDef {
     return {
       name: 'phone_answer',
@@ -1245,7 +1371,8 @@ export class PhoneWorld implements World {
       name: 'phone_dial',
       description:
         '主动拨一通语音电话给开发者(这一路只有这一个拨号目标,就是配置里那个人)。' +
-        '不在通话里时才能拨。拨出去他接起之后你们就在一通里:你说的会被念给他听,他说的会作为事件给你。',
+        '不在通话里时才能拨。拨出去他接起之后你们就在一通里:要说什么就调 phone_say(直接写下的正文这一路也会被念出去),' +
+        '他说的会作为事件给你。',
       tags: ['act'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       handler: async (): Promise<string | ToolOutcome> => {

@@ -179,6 +179,12 @@ describe('事件正文', () => {
     expect(text).toContain(String(HIM));
   });
 
+  it('★ 接通那句必须点明"你从哪儿出声" —— 只讲入站那一半,她整通都会沉默(2026-10-14 实测)', () => {
+    const text = describeConnected(call({ phase: 'connected' }));
+    expect(text).toContain('phone_say');
+    expect(text).toContain('别沉默');
+  });
+
   it('挂断那句带历时与两边各说了多少', () => {
     const text = describeEnded(
       call({ phase: 'ended', endedAt: 1_700_000_000_000 + 95_000, nativeEndEvent: 'peer.hangup' }),
