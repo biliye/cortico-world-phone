@@ -14,6 +14,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import type { spawn } from 'node:child_process';
 import type WebSocket from 'ws';
@@ -117,6 +118,18 @@ function whyFailed(reply: { error?: { code?: string; message?: string } }): stri
  */
 function alreadyHasBlock(reply: { error?: { code?: string; message?: string } }): boolean {
   return reply.error?.code === 'REQUEST_ID_REUSED' || /unique while pending/i.test(reply.error?.message ?? '');
+}
+
+/**
+ * `audio.write` 的**请求 id**:短、且同一块恒定。
+ *
+ * 两个约束叠起来才有这个形状:
+ * ① 上游 `request.id` 上限 **80 字符**(`daemon.mjs:511`,超了回 `INVALID_REQUEST`);
+ * ② 重问必须用**同一个 id**(上游按 id 记住在办的那一条,复用 id 才算安全重问)。
+ * 真实部署的通话 id 是 75 字符的 `<linkEpoch>:<n>:<nativeId>`,拼进去必超 ⇒ 用它的短哈希 + 序号。
+ */
+function audioRequestId(callId: string, sequence: number): string {
+  return `aw-${sequence}-${createHash('sha1').update(callId).digest('hex').slice(0, 8)}`;
 }
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
@@ -1139,10 +1152,21 @@ export class PhoneWorld implements World {
     const ledger = this.playback;
     if (!chunk.utterance.frames.has(id)) ledger.frame(chunk.utterance, id);
     const sentAt = this.now();
+    // **请求 id 与播放编号是两件事**(2026-10-15 实测栽在这上面):上游对 `request.id` 有
+    // 80 字符上限(`daemon.mjs:511` 的 `request.id.length>80` ⇒ INVALID_REQUEST),
+    // 而这套部署的通话 id 是 75 字符的 `<linkEpoch>:<n>:<nativeId>` —— 拿 `utt-<通话id>-<序号>`
+    // 当请求 id 一加前缀就超,桥每一块都回"无效请求",她一个字都出不去(而单测全绿)。
+    const requestId = audioRequestId(call.id, chunk.sequence);
+    // 参数**只拼一次**:重问必须连 timestamp 都一字不改 —— 上游按 id + 参数指纹去重,
+    // 参数一变它就成了"同一个 id 换了内容",既去不了重,还可能把同一句念两遍。
+    const frame = {
+      callId: call.id, encoding: 'pcm_s16le', sampleRate: this.bridgeRate, channels: this.bridgeChannels,
+      sequence: chunk.sequence, timestamp: this.now(), data: chunk.pcm.toString('base64'),
+    };
     // 兜底写死一遍(和 config 的默认值一致):老部署那份 config.json 里没有这几个键,
     // 框架虽然会把 defaults 铺在前面,但"没有重试"和"有重试"是两种行为,不留给合并细节赌。
     const attempts = Math.max(1, 1 + (this.opts.cfg.audioWriteRetries ?? 2));
-    let reply = await this.sendChunk(chunk, id, signal);
+    let reply = await this.sendChunk(frame, id, requestId, signal);
     for (let attempt = 2; attempt <= attempts; attempt += 1) {
       if (reply.ok || signal.aborted) break;
       // "队列满"有它自己那条重试(见下),别混在一起。
@@ -1154,7 +1178,7 @@ export class PhoneWorld implements World {
       });
       await this.waitAudio(Math.max(0, this.opts.cfg.audioWriteRetryWaitMs ?? 2000), signal);
       if (signal.aborted) break;
-      reply = await this.sendChunk(chunk, id, signal);
+      reply = await this.sendChunk(frame, id, requestId, signal);
     }
     if (signal.aborted || generation !== this.speakGeneration || this.current?.id !== call.id) return;
     this.maxLagMs = Math.max(this.maxLagMs, this.now() - chunk.atMs);
@@ -1194,21 +1218,18 @@ export class PhoneWorld implements World {
     }
   }
 
-  /** 把一块按**原 id**交给桥。等回执的上限比别的命令长得多(见 config 那段)。 */
-  private sendChunk(chunk: AudioChunk, id: string, signal: AbortSignal) {
-    const call = this.current!;
+  /**
+   * 把一块交给桥。
+   *
+   * `playbackId` 是**播放编号**(上游上限 160 字符),`requestId` 是**请求 id**(上限 80 字符),
+   * 两者别混 —— 它们的上限不同,拿前者当后者的那天桥当场回了 INVALID_REQUEST。
+   * `frame` 由调用方拼一次、几次重问共用同一份(见 `writeChunk` 那段)。
+   */
+  private sendChunk(frame: Record<string, unknown>, playbackId: string, requestId: string, signal: AbortSignal) {
     return this.bridge!.request(
       'audio.write',
-      {
-        callId: call.id,
-        playbackId: id,
-        frame: {
-          callId: call.id, encoding: 'pcm_s16le', sampleRate: this.bridgeRate,
-          channels: this.bridgeChannels, sequence: chunk.sequence, timestamp: this.now(),
-          data: chunk.pcm.toString('base64'),
-        },
-      },
-      { signal, id, timeoutMs: this.opts.cfg.audioWriteTimeoutMs ?? 30000 },
+      { callId: frame.callId, playbackId, frame },
+      { signal, id: requestId, timeoutMs: this.opts.cfg.audioWriteTimeoutMs ?? 30000 },
     );
   }
 

@@ -37,6 +37,8 @@ export interface FakeCall {
 export interface RecordedRequest {
   op: string;
   args: Record<string, unknown>;
+  /** 请求 id —— 上游对它有 80 字符上限，测试要能量到它。 */
+  id?: string;
 }
 
 export class FakeBridge {
@@ -226,18 +228,46 @@ export class FakeBridge {
     }
     if (packet.type !== 'request' || typeof packet.id !== 'string' || typeof packet.op !== 'string') return;
     const args = packet.args ?? {};
-    this.requests.push({ op: packet.op, args });
+    this.requests.push({ op: packet.op, args, id: packet.id });
+    // 上游对请求形状的**硬校验**(`daemon.mjs:511`)。照抄它的判据是拿代价换来的:
+    // 2026-10-15 World 把 81 字符的**播放编号**当成了**请求 id**(桥的 `request.id` 上限 80),
+    // 桥每一块都回 INVALID_REQUEST、她一个字都出不去,而当时 189 条单测全绿 ——
+    // 假桥没校这一条。契约在假件里漏一格,就得等到第三级(他打电话时)才暴露。
+    if (!packet.id || packet.id.length > 80) {
+      this.reply(socket, packet.id, { ok: false, error: { code: 'INVALID_REQUEST', message: '无效请求' } });
+      return;
+    }
+    if (packet.op === 'audio.write') {
+      // `daemon.mjs:575` 音频字段校验里最容易写错的两条:id 的上限、以及帧与通话对不上。
+      const frame = (args.frame ?? {}) as { data?: unknown; callId?: unknown };
+      const playbackId = typeof args.playbackId === 'string' ? args.playbackId : '';
+      const bad =
+        !playbackId || playbackId.length > 160 || typeof frame.data !== 'string' ||
+        frame.callId !== args.callId ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(frame.data);
+      if (bad) {
+        this.reply(socket, packet.id, { ok: false, error: { code: 'INVALID_AUDIO', message: '音频格式必须与桥接配置相同' } });
+        return;
+      }
+    }
     if (packet.op === 'audio.write' && this.audioWriteDelayMs > 0) {
       await new Promise((r) => setTimeout(r, this.audioWriteDelayMs));
     }
     if (this.holdOps.has(packet.op)) return;
     const custom = this.onRequest?.(packet.op, args);
-    const reply = custom ?? this.defaultReply(packet.op, args);
+    this.reply(socket, packet.id, custom ?? this.defaultReply(packet.op, args));
+  }
+
+  private reply(
+    socket: WebSocket,
+    id: string,
+    reply: { ok: boolean; data?: unknown; error?: { code: string; message: string } },
+  ): void {
     if (socket.readyState !== 1) return;
     socket.send(
       JSON.stringify({
         type: 'reply',
-        id: packet.id,
+        id,
         ok: reply.ok,
         ...(reply.ok ? { data: reply.data ?? {} } : { error: reply.error }),
       }),

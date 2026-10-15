@@ -185,6 +185,27 @@ describe('实机复核的回归边界', () => {
     await waitFor(() => synths === 2);
     expect((await callTool('phone_status')).text).toContain('发送结果不明');
   });
+  it('★ 真实那串 75 字符的通话 id 下,请求 id 不越桥的 80 字符上限(那天哑的直接原因)', async () => {
+    // 上游 `daemon.mjs:511`:`request.id.length>80` ⇒ INVALID_REQUEST。
+    // 真实部署的通话 id 是 `<linkEpoch>:<n>:<nativeId>` 共 75 字符 —— 拿它拼
+    // `utt-<通话id>-<序号>` 当**请求 id**,一加前缀就超,桥于是每一块都回"无效请求",
+    // 她一个字都出不去(2026-10-15 夜那一通就是这个,而当时 189 条单测全绿:
+    // 假桥没校这一条)。播放编号(上限 160)可以有 81 字符,请求 id 不行 —— 两者不是一回事。
+    const longCallId = '7e438e01-d9ae-49f9-bf6f-ad6440ada573:0:688b7518-8cd3-4743-9df4-7661c0aa81ac';
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(800, 32000) }));
+    await connect(host, longCallId);
+    await callTool('phone_say', { text: '短句子。' });
+    const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
+    await waitFor(() => writes().length >= 1);
+    for (const write of writes()) {
+      expect(write.id).toBeTruthy();
+      expect(write.id!.length).toBeLessThanOrEqual(80);
+    }
+    expect(String(writes()[0]!.args.playbackId).length).toBeGreaterThan(80); // 播放编号本来就长
+    await new Promise(r => setTimeout(r, 200));
+    // 桥收下了(不是被判无效)⇒ 不会有"没确认收到"那条通知。
+    expect(host.events.some(e => e.text?.includes('一直没确认收到'))).toBe(false);
+  });
   it('流式多次增量只发固定帧和一个句末尾帧，PCM 总量不变', async () => {
     const pcm = tone(925, 32000);
     const packets: string[] = [];
