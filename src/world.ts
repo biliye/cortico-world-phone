@@ -102,6 +102,17 @@ const unheardLine = (ms: number): string => `(这一句没听清,${(ms / 1000).t
  */
 const HANGUP_RETRY_DELAY_MS = 2500;
 
+/**
+ * "说完再挂"的两条下限(2026-10-15 他提的)。
+ *
+ * 旧行为:她一调 `phone_hangup` 就当场发挂断命令 ⇒ 正在念的句子被切断(他听到的是
+ * "话说到一半就断了")。现在挂断分两步:工具只**排队挂断**,由看护在"这一轮的话说完、
+ * 播放时间也过去"之后再发真正的命令。
+ */
+const HANGUP_MIN_GRACE_MS = 1000;
+/** 要先连着安静这么多拍(WATCH_MS 一拍)才算"说完了" —— 免得同轮的告别正文还没到场就挂了。 */
+const HANGUP_QUIET_TICKS = 2;
+
 /** 回执里那句"为什么没成":上游的原话 + 它给的码。**码先看** —— 2026-10-10 那次就是靠它认出来的。 */
 function whyFailed(reply: { error?: { code?: string; message?: string } }): string {
   const message = reply.error?.message ?? '桥没给原因';
@@ -240,6 +251,14 @@ export class PhoneWorld implements World {
   private unconfirmedBlocks = 0;
   /** 这一通里"接起后第一句之前垫静音"做过没有(2026-10-15)。接起时复位。 */
   private warmupSent = false;
+  /**
+   * 排好队等着挂的那一通(2026-10-15 他提的"说完再挂")。
+   *
+   * 为什么不在工具里直接挂、也不在工具里死等:她要挂的那一轮里通常还写着一句告别
+   * (正文),那句是**在工具返回之后**才进合成队列的。死等会把那句告别永远等掉,
+   * 直接挂则把它连人带话一起切断。所以工具只排个队,真正的挂断交给看护。
+   */
+  private hangupPending?: { atMs: number; reason: string; quietTicks: number };
   /** 这一通里"有音频没被确认"这件事只当面说一次,别把她的上下文刷满。 */
   private unconfirmedNoted = false;
   private qqDiagnostic = '';
@@ -678,6 +697,7 @@ export class PhoneWorld implements World {
     this.unconfirmedBlocks = 0;
     this.unconfirmedNoted = false;
     this.warmupSent = false;
+    this.hangupPending = undefined;
     this.speakBuffer = '';
     this.speakQueue = [];
     this.audioQueue = [];
@@ -976,6 +996,8 @@ export class PhoneWorld implements World {
       this.saidThisRound.clear();
       // 上一轮她按过停 —— 那是"这一轮"的事,新一轮照常能说。
       this.roundMuted = false;
+      // 但**排好挂断之后**不再出声:她那句告别属于"挂之前那一轮",后面不该再添话。
+      if (this.hangupPending) this.roundMuted = true;
       return;
     }
     if (e.type === 'response.output_text.delta' && typeof e.delta === 'string' && e.delta !== '') {
@@ -1324,6 +1346,17 @@ export class PhoneWorld implements World {
       this.stopWatch();
       return;
     }
+    // 排好挂断的那一通:先等她说完(还要连着安静两拍),或者等过头了就直接挂。
+    if (this.hangupPending) {
+      const waited = this.now() - this.hangupPending.atMs;
+      const quiet = !this.synthBusy && this.speakQueue.length === 0 && this.audioQueue.length === 0 && this.now() >= this.paceEndMs;
+      this.hangupPending.quietTicks = quiet ? this.hangupPending.quietTicks + 1 : 0;
+      const finished = this.hangupPending.quietTicks >= HANGUP_QUIET_TICKS && waited >= HANGUP_MIN_GRACE_MS;
+      if (finished || waited >= (this.opts.cfg.hangupGraceMs ?? 12000)) {
+        await this.commitHangup(finished ? '说完了' : `等够了 ${Math.round(waited / 1000)} 秒`);
+      }
+      return;
+    }
     const policy = this.policy();
     // 响铃超时:没人接就自动拒(用户定的 30 秒)。
     if (!this.ringRejected && ringTimedOut(call, policy, this.now())) {
@@ -1343,6 +1376,36 @@ export class PhoneWorld implements World {
         await this.selfHeal(held, call.phase);
       }
     }
+  }
+
+  /**
+   * 真正把挂断命令发出去(排队那一步在 `phone_hangup` 工具里,时机在看护这一拍)。
+   *
+   * 第一次失败会自己再试一次 —— 上游那个电话宿主在通话结束时会自己重启一次,那几秒里
+   * 它的原生能力还没就绪(`Requires an exact audited QQ library…` 是那句会骗人的理由)。
+   */
+  private async commitHangup(why: string): Promise<void> {
+    const pending = this.hangupPending;
+    const callId = this.current?.id;
+    this.hangupPending = undefined;
+    if (!pending || !callId) return;
+    const first = await this.send('hangup', { callId });
+    if (first.ok) {
+      await this.note(`挂断发出去了(${why})${pending.reason}。真正结束以 phone.ended 事件为准。`);
+      return;
+    }
+    await sleep(HANGUP_RETRY_DELAY_MS);
+    const second = await this.send('hangup', { callId });
+    await this.note(
+      second.ok
+        ? `挂断第一次没成功(${whyFailed(first)}),等一下又试了一次,这次发出去了(${why})${pending.reason}。`
+        : `挂断没发成功:${whyFailed(second)},两次都是这个原因。**跟他说一句「我这边挂不掉,你挂一下」** —— 他挂了这通一样会结束。`,
+    );
+  }
+
+  /** 现在手上还有没有没说完的话(工具回执用它说清楚"是这就挂"还是"说完再挂")。 */
+  private sayingSomething(): boolean {
+    return this.synthBusy || this.speakQueue.length > 0 || this.audioQueue.length > 0 || this.now() < this.paceEndMs;
   }
 
   /**
@@ -1424,6 +1487,9 @@ export class PhoneWorld implements World {
               (call ? '等它变成"通话中"再调,或者先调 phone_answer 接起来。' : '要打给他就先调 phone_dial。'),
             failed: true,
           };
+        }
+        if (this.hangupPending) {
+          return { text: '这一通已经排好挂断了,这一句没有进合成队列 —— 要说的就说在挂之前那一轮里。', failed: true };
         }
         const raw = typeof args.text === 'string' ? args.text : '';
         if (raw.trim() === '') return { text: 'text 是空的,这一句没念。', failed: true };
@@ -1537,7 +1603,10 @@ export class PhoneWorld implements World {
   private hangupTool(): ToolDef {
     return {
       name: 'phone_hangup',
-      description: '挂断当前这通电话。可以带一句为什么挂(只进你的上下文与日志，不会被念给对方)。',
+      description:
+        '挂断当前这通电话。**是"说完再挂"**:你正在念的这一句会念完(这一轮里写的道别也会被念出来),' +
+        '然后才真正挂断 —— 所以道别就说在这一轮里。可以带一句为什么挂(只进你的上下文与日志，不会被念给对方)。' +
+        '调一次就够,不要重复调;真正结束以 phone.ended 事件为准。',
       tags: ['act'],
       parameters: {
         type: 'object',
@@ -1548,27 +1617,18 @@ export class PhoneWorld implements World {
         const call = this.current;
         if (!call) return { text: '现在没有通话可挂。', failed: true };
         const reason = typeof args.reason === 'string' && args.reason.trim() !== '' ? `(原因:${args.reason.trim()})` : '';
-        const first = await this.send('hangup', { callId: call.id });
-        if (first.ok) return `已提交挂断${reason}。真正结束以 phone.ended 事件为准。`;
-
-        // 第一次失败就**自动再试一次**,不是让她自己猜。
-        // 为什么值得这一次重试:上游那个电话宿主在通话**由对方结束**时(或它自己出问题时)会主动退出,
-        // 被监督脚本 2 秒后拉起 —— 而它从起进程到原生能力就绪要好几秒,那几秒里这道命令会被一句
-        // 会误导人的理由拒掉。2026-10-10 实测:她挂断失败的那两次正落在那个窗口里,理由是
-        // `Requires an exact audited QQ library…`(看着像"这个 QQ 版本不支持",其实只是"还没就绪")。
-        await sleep(HANGUP_RETRY_DELAY_MS);
-        const second = await this.send('hangup', { callId: call.id });
-        if (second.ok) {
-          return `第一次挂断没成功(${whyFailed(first)}),等一下又试了一次,这次提交上了${reason}。真正结束以 phone.ended 事件为准。`;
+        if (this.hangupPending) {
+          return `已经在等着挂了${reason} —— 说完就挂,不用再调一次。`;
         }
-        return {
-          text:
-            `挂断命令没发成功:${whyFailed(second)},又试一次也是同一个原因。` +
-            '这一路偶尔会被上游拒 —— 云上那个电话宿主在通话结束时会自己重启一次,那几秒里它的原生能力还没就绪。' +
-            '**直接跟他说一句「我这边挂不掉,你挂一下」** —— 他挂了这通一样会结束。' +
-            '要是他那边也不方便,过一会儿再调一次 phone_hangup。',
-          failed: true,
-        };
+        // **排队挂断,不是当场挂**(2026-10-15 他提的"说完再挂")。
+        // 真正那一下由看护在这一轮的话说完、播放时间也过去之后发出去;这一轮里她写的告别
+        // (正文)照常会被念出来 —— 那正是"说完"的一部分。
+        const pending = this.sayingSomething();
+        this.hangupPending = { atMs: this.now(), reason, quietTicks: 0 };
+        this.startWatch();
+        return pending
+          ? `好,等这一句说完就挂${reason}。真正结束以 phone.ended 事件为准 —— 不用再调一次。`
+          : `这就挂${reason}。真正结束以 phone.ended 事件为准。`;
       },
     };
   }

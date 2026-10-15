@@ -185,6 +185,29 @@ describe('实机复核的回归边界', () => {
     await waitFor(() => synths === 2);
     expect((await callTool('phone_status')).text).toContain('发送结果不明');
   });
+  it('★ 她正说着时挂断:先把这句说完再发挂断命令,不是当场切断', async () => {
+    // 他 2026-10-15 报的:他让她挂的时候她正说到一半,旧行为当场切断。
+    // 4 秒长的一句:这样"还没说完"是**确定**的,不受机器快慢影响(1.6 秒那种在全量跑时会来不及)。
+    const host = await startWorld({ hangupGraceMs: 20000 }, fakeServices({ herSpeech: tone(4000, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '这一句还没说完。' });
+    const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
+    await waitFor(() => writes().length >= 1);
+    const hung = () => bridge!.requests.filter(r => r.op === 'hangup');
+    const reply = await callTool('phone_hangup', { reason: '他说挂吧' });
+    expect(reply.failed).toBe(false);
+    expect(reply.text).toContain('说完就挂');
+    await new Promise((r) => setTimeout(r, 500));
+    // 话还没说完 ⇒ 挂断命令一个字都还没发出去
+    expect(hung().length).toBe(0);
+    // 说完了它自己发出去(不用她再调一次)
+    await waitFor(() => hung().length >= 1, 15000, '挂断命令');
+    expect(String(hung()[0]!.args.callId)).toBe(String(bridge!.calls.get('c1')!.id));
+    // 挂了以后不再接新句子(等 phone.ended 到了再问 —— 命令发出与通话真正结束之间有几毫秒)
+    await waitFor(() => host.events.some((e) => e.type === 'phone.ended'), 8000, 'phone.ended');
+    expect((await callTool('phone_say', { text: '挂了以后还想说。' })).failed).toBe(true);
+  });
+
   it('★ 接起后第一句之前垫一段静音(暖 QQ 那条媒体通道),而且只垫一次', async () => {
     // 他实测第一句开头被吞("喂，我在"只听到"我在")。音频是完整进了声卡的(逐句标记是
     // "桥确认播放完成"),丢在 QQ 那条通道刚起的时候 ⇒ 垫静音去暖它,而不是拿她的第一个字去暖。
@@ -716,36 +739,36 @@ describe('工具回执', () => {
   };
 
   it('★ 挂断第一次失败会**自动再试一次**;两次都失败就把出路说清,并带上上游的码', async () => {
-    const host = await startWorld();
-    bridge!.ring('c1', String(HIM));
-    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    // 2026-10-15 起挂断是"排队 + 看护发命令",所以那两条结果走**通知**告诉她,不再是工具回执。
+    const host = await startWorld({ hangupGraceMs: 20000 }, fakeServices({ herSpeech: tone(300, 32000) }));
+    await connect(host);
     bridge!.onRequest = (op) => (op === 'hangup' ? { ok: false, error: AUDIT_REFUSAL } : undefined);
-    const hangup = world!.tools().find((t) => t.name === 'phone_hangup')!;
-    const outcome = (await hangup.handler({}, {} as never)) as { text: string; failed?: boolean };
-    expect(outcome.failed).toBe(true);
+    const reply = await callTool('phone_hangup', { reason: '他说挂吧' });
+    expect(reply.failed).toBe(false);
+    await waitFor(() => host.events.some((e) => e.text?.includes('挂断没发成功')), 12000, '挂断失败的通报');
     // 试了两次(不是试一次就放手)
     expect(bridge!.requests.filter((r) => r.op === 'hangup')).toHaveLength(2);
+    const note = host.events.find((e) => e.text?.includes('挂断没发成功'))!.text!;
     // 码要在里面:那条误导人的理由光看 message 认不出是什么毛病
-    expect(outcome.text).toContain('CAPABILITY_UNAVAILABLE');
+    expect(note).toContain('CAPABILITY_UNAVAILABLE');
     // 出路要给她:让他挂,而不是让她自己反复试
-    expect(outcome.text).toContain('你挂一下');
+    expect(note).toContain('你挂一下');
   });
 
   it('挂断第一次失败、第二次成了:如实说是哪一次成的', async () => {
-    const host = await startWorld();
-    bridge!.ring('c1', String(HIM));
-    await waitFor(() => host.events.some((e) => e.type === 'phone.connected'));
+    const host = await startWorld({ hangupGraceMs: 20000 }, fakeServices({ herSpeech: tone(300, 32000) }));
+    await connect(host);
     let attempts = 0;
     bridge!.onRequest = (op) => {
       if (op !== 'hangup') return undefined;
       attempts += 1;
       return attempts === 1 ? { ok: false, error: AUDIT_REFUSAL } : undefined; // 第二次走默认回执 = 成功
     };
-    const hangup = world!.tools().find((t) => t.name === 'phone_hangup')!;
-    const text = String(await hangup.handler({}, {} as never));
+    await callTool('phone_hangup', {});
+    await waitFor(() => host.events.some((e) => e.text?.includes('这次发出去了')), 12000, '挂断第二次成功的通报');
     expect(attempts).toBe(2);
-    expect(text).toContain('又试了一次');
-    expect(text).toContain('提交上了');
+    const note = host.events.find((e) => e.text?.includes('这次发出去了'))!.text!;
+    expect(note).toContain('第一次没成功');
   });
 });
 

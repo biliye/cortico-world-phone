@@ -146,6 +146,14 @@ export interface PhoneConfigSection {
   /** 清队列(`audio.clear`)最多试几次 —— 喊停这件事值得多试一次。 */
   audioClearRetries: number;
   /**
+   * 她调 `phone_hangup` 之后，最多等多少毫秒把这一句说完再挂（0 = 不等，当场挂）。
+   *
+   * 2026-10-15 他提的：他要挂、她正在说，旧行为当场切断。现在挂断分两步 —— 工具只排队，
+   * 看护等"这一轮的话说完 + 播放时间过去 + 连着安静两拍"再发真正的命令；这个数是兜底的上限，
+   * 免得她一直有新话就把挂断无限推迟。
+   */
+  hangupGraceMs: number;
+  /**
    * **接起后第一句之前**先垫多少毫秒静音(0 = 不垫)。
    *
    * 2026-10-15 他实测:第一句的开头被吞("喂，我在"只听到"我在"),而音频是完整进了声卡的
@@ -184,6 +192,7 @@ export const PHONE_DEFAULTS: PhoneConfigSection = {
   audioWriteRetryWaitMs: 2000,
   audioClearRetries: 2,
   warmupMs: 300,
+  hangupGraceMs: 12000,
   reconnectBaseMs: 1000,
   reconnectMaxMs: 30000,
   logAudio: false,
