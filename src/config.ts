@@ -145,6 +145,14 @@ export interface PhoneConfigSection {
   audioWriteRetryWaitMs: number;
   /** 清队列(`audio.clear`)最多试几次 —— 喊停这件事值得多试一次。 */
   audioClearRetries: number;
+  /**
+   * **接起后第一句之前**先垫多少毫秒静音(0 = 不垫)。
+   *
+   * 2026-10-15 他实测:第一句的开头被吞("喂，我在"只听到"我在"),而音频是完整进了声卡的
+   * (逐句标记是"桥确认播放完成")⇒ 丢在 QQ 那条媒体通道刚起来的时候。垫静音是拿闲着的
+   * 时间把那几帧暖掉,而不是拿她的第一个字去暖。静音垫在**同一帧**里,不会多开播放流。
+   */
+  warmupMs: number;
   /** 桥重连的退避起点与上限(毫秒)。 */
   reconnectBaseMs: number;
   reconnectMaxMs: number;
@@ -175,6 +183,7 @@ export const PHONE_DEFAULTS: PhoneConfigSection = {
   audioWriteRetries: 2,
   audioWriteRetryWaitMs: 2000,
   audioClearRetries: 2,
+  warmupMs: 300,
   reconnectBaseMs: 1000,
   reconnectMaxMs: 30000,
   logAudio: false,

@@ -238,6 +238,8 @@ export class PhoneWorld implements World {
    * 现在:按原 id 多问几次,还问不到就**记下来、说清楚、继续往下说**。
    */
   private unconfirmedBlocks = 0;
+  /** 这一通里"接起后第一句之前垫静音"做过没有(2026-10-15)。接起时复位。 */
+  private warmupSent = false;
   /** 这一通里"有音频没被确认"这件事只当面说一次,别把她的上下文刷满。 */
   private unconfirmedNoted = false;
   private qqDiagnostic = '';
@@ -675,6 +677,7 @@ export class PhoneWorld implements World {
     this.speechAbort = new AbortController();
     this.unconfirmedBlocks = 0;
     this.unconfirmedNoted = false;
+    this.warmupSent = false;
     this.speakBuffer = '';
     this.speakQueue = [];
     this.audioQueue = [];
@@ -1072,6 +1075,15 @@ export class PhoneWorld implements World {
             }
             this.pumpWriter();
           };
+          // **接起后的第一句之前垫一小段静音**(2026-10-15 他报的):他实测第一句开头被吞
+          // ("喂，我在"只听到"我在")。音频本身是完整进了声卡的(逐句标记是"桥确认播放完成"),
+          // 丢在 QQ 那条媒体通道刚起来的时候 ⇒ 拿静音去暖它,而不是拿她的第一个字。
+          // 垫在**同一帧里**(先喂 framer,再由她的话把这一帧填满),所以不会因此多开一次播放流。
+          if (!this.warmupSent && (this.opts.cfg.warmupMs ?? 0) > 0) {
+            this.warmupSent = true;
+            const bytes = Math.round((this.bridgeRate * this.bridgeChannels * 2 * (this.opts.cfg.warmupMs ?? 0)) / 1000);
+            queueFrames(framer.push(Buffer.alloc(bytes), false));
+          }
           const result = await synthesizePcm(utterance.text, {
             settings: this.opts.cfg.tts,
             apiKey: this.opts.secret(this.opts.cfg.tts.apiKeySecret),

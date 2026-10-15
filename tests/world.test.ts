@@ -185,6 +185,30 @@ describe('实机复核的回归边界', () => {
     await waitFor(() => synths === 2);
     expect((await callTool('phone_status')).text).toContain('发送结果不明');
   });
+  it('★ 接起后第一句之前垫一段静音(暖 QQ 那条媒体通道),而且只垫一次', async () => {
+    // 他实测第一句开头被吞("喂，我在"只听到"我在")。音频是完整进了声卡的(逐句标记是
+    // "桥确认播放完成"),丢在 QQ 那条通道刚起的时候 ⇒ 垫静音去暖它,而不是拿她的第一个字去暖。
+    const host = await startWorld({ warmupMs: 300 }, fakeServices({ herSpeech: tone(800, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '第一句。' });
+    const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
+    await waitFor(() => writes().length >= 3);
+    const bytes = (w: { args: Record<string, unknown> }) =>
+      Buffer.from((w.args.frame as { data: string }).data, 'base64');
+    const silenceBytes = Math.round(48000 * 2 * 2 * 0.3);   // 桥报的 48k/2ch
+    const toneBytes = 48000 * 2 * 2 * 0.8;                  // 800ms 的测试音
+    // 第一帧 = 300ms 静音 + 她话的头 100ms ⇒ 开头这一段必须是全零,后面才是声音
+    const first = bytes(writes()[0]!);
+    expect(first.length).toBe(76800);
+    expect(first.subarray(0, silenceBytes).every(b => b === 0)).toBe(true);
+    expect(first.subarray(silenceBytes).some(b => b !== 0)).toBe(true);
+    expect(writes().slice(0, 3).reduce((n, w) => n + bytes(w).length, 0)).toBe(silenceBytes + toneBytes);
+    // 第二句不再垫:它的字节数正好是音频本身
+    await callTool('phone_say', { text: '第二句。' });
+    await waitFor(() => writes().length >= 5);
+    expect(writes().slice(3).reduce((n, w) => n + bytes(w).length, 0)).toBe(toneBytes);
+  });
+
   it('★ 真实那串 75 字符的通话 id 下,请求 id 不越桥的 80 字符上限(那天哑的直接原因)', async () => {
     // 上游 `daemon.mjs:511`:`request.id.length>80` ⇒ INVALID_REQUEST。
     // 真实部署的通话 id 是 `<linkEpoch>:<n>:<nativeId>` 共 75 字符 —— 拿它拼
@@ -214,7 +238,8 @@ describe('实机复核的回归边界', () => {
     }
     packets.push('data: {"data":{"status":2}}\n\n');
     const services = (async () => new Response(packets.join(''), { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch;
-    const host = await startWorld({ tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test', streaming: true } }, services);
+    // 这一条只考"网络分片不改样本",所以把接起后垫的那段静音关掉(它单有一条测试)。
+    const host = await startWorld({ warmupMs: 0, tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test', streaming: true } }, services);
     await connect(host);
     await callTool('phone_say', { text: '完整连续。' });
     const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
