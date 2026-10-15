@@ -48,6 +48,7 @@ import { downmixToMono, durationMs, pcmToWav, resampleMono, sliceFrames, toChann
 import { flushSentence, speechKey, takeSentences, worthSpeaking } from './sentences.ts';
 import { SshTunnel } from './ssh.ts';
 import { synthesizePcm } from './tts.ts';
+import { PlaybackLedger, type Utterance } from './playback.ts';
 import { clock, describe, humanSeconds, sleep, type VoiceLoggerLike } from './util.ts';
 
 /** 桥那一头要求的音频格式(与 bridge.json 的 audio 段一致)。连上后由它报的 status 核对。 */
@@ -65,14 +66,7 @@ const WATCH_MS = 1000;
  */
 const RING_GRACE_MS = 6000;
 
-/**
- * 往外写音频时最多领先播放多少毫秒。
- *
- * 取值来自实测:上游播放队列是 `maxQueueMs: 2000`,而那个 sink 自己还有约 1 秒的固有延迟
- * (`pactl` 报 `Latency: ~994000 usec`)—— 两处加起来的管道深度不能顶到 2000,否则每句开头
- * 都会撞"队列满"。所以领先 500 毫秒:管道里始终压着半秒多,离上限还有一倍余量,
- * 而且他听到她开口也更早。灌满的后果见 `pace()` 的注释。
- */
+/** 写入领先量的保守上限；桥的队列容量为 2 秒，不能在静默时积攒额度。 */
 const PACE_LEAD_MS = 500;
 
 /**
@@ -82,8 +76,6 @@ const PACE_LEAD_MS = 500;
  * "没认出来"的那些段是 1.9~4.5 秒。1.5 秒开在中间 —— 短于它当噪声丢掉,长于它就得让她知道。
  */
 const UNHEARD_MIN_MS = 1500;
-/** 桥那条播放队列一直满,最多陪着等这么久(毫秒)才认栽丢一块。 */
-const STALL_GIVE_UP_MS = 20000;
 /** 卡住多久才值得惊动她(几帧的抖动不算)。 */
 const STALL_NOTICE_MS = 3000;
 /** 同一件事别连着说:两次"没听清"至少隔这么久(毫秒)。 */
@@ -134,9 +126,10 @@ export interface PhoneWorldOptions {
 
 /** 一块待发出的音频。`sequence` 在切片时就定好，保证与入队顺序一致。 */
 interface AudioChunk {
+  utterance: Utterance;
   pcm: Buffer;
   sequence: number;
-  /** 入队时刻:只为量"他听到时晚了多久"。 */
+  /** 入队时刻：测到写入回执的等待，不冒充听到的时间。 */
   atMs: number;
 }
 
@@ -204,11 +197,15 @@ export class PhoneWorld implements World {
 
   /** 嘴:待合成的句子与待发出的音频。 */
   private speakBuffer = '';
-  private speakQueue: string[] = [];
+  private speakQueue: Utterance[] = [];
   private audioQueue: AudioChunk[] = [];
   private sequence = 0;
   private synthBusy = false;
   private writerBusy = false;
+  private speechAbort = new AbortController();
+  private clearPending?: Promise<void>;
+  private outputBlocked = false;
+  private playback = new PlaybackLedger();
   /** 换代:抢话或通话结束时 +1，正在跑的合成/发送据此自己停下。 */
   private speakGeneration = 0;
   private plannedSpeechMs = 0;
@@ -230,7 +227,7 @@ export class PhoneWorld implements World {
   /** 这一通已经因为"几乎听不见他"说过一次了(一通只说一次)。 */
   private deafNoticed = false;
   /**
-   * 这一通的逐句记录:他说的(认出来的正文)与她**真正念出去的**句子,按发生先后排。
+   * 这一通的逐句记录:他说的(认出来的正文)与她提交的句子及播放状态,按发生先后排。
    * 收尾时整块附在 `phone.ended` 后面给她 —— 记不记进她的记忆由她自己决定,这一包不替她写。
    */
   private transcript: TranscriptLine[] = [];
@@ -238,13 +235,12 @@ export class PhoneWorld implements World {
   private stalledSinceMs = 0;
   /** 这一通已经因为"卡住"提醒过她了(一通只说一次)。 */
   private stallNoticed = false;
-  /** 这一通里他最晚才听到的那一块,已经晚了多久(毫秒)。收尾时报出来。 */
+  /** 音频块从本地入队到写入回执的等待峰值(毫秒)，不含声学播放确认。 */
   private maxLagMs = 0;
-  /** 这一通实际写进桥的音频毫秒数(与通话历时对比 = 桥那头的吞吐)。 */
+  /** 这一通取得成功写入回执的音频毫秒数；不代表实际播放时长。 */
   private wroteAudioMs = 0;
-  /** 配速:这一段已经写出去多少毫秒音频、从什么时候开始写的。 */
-  private paceWrittenMs = 0;
-  private paceStartMs = 0;
+  /** 按成功提交量估算的队尾播放时刻；不作为播放凭据。 */
+  private paceEndMs = 0;
   /**
    * 她自己按了停(`phone_stop`):这一轮剩下的正文不再念。
    * 下一轮(`response.created`)自己解开 —— 她要接着说话，随时可以说。
@@ -401,6 +397,7 @@ export class PhoneWorld implements World {
           void this.onCall(call).catch((error) => this.log.warn?.('处理通话变化出错', { error: describe(error) }));
         },
         onAudio: (frame) => this.onAudioFrame(frame),
+        onPlayback: (receipt) => this.playback.receipt(receipt),
         onStatus: (status, kind) => this.onStatus(status, kind),
         onError: (message) => {
           void this.note(`桥报了一个错:${message}`);
@@ -444,6 +441,15 @@ export class PhoneWorld implements World {
     };
   }
 
+  /** 上下文交接只补当前通话的短快照，不另开人格、不自动写记忆。 */
+  onHandoffEnded(): void {
+    if (!this.onCallNow()) return;
+    const recent = this.transcript.slice(-8).map(line =>
+      `${line.who === 'him' ? '他' : '她'}${line.playback ? `（${line.playback}）` : ''}：${line.text}`,
+    ).join('\n').slice(-1200);
+    void this.emit('phone.context', `【电话】上下文已交接，当前通话仍在。${this.playback.summary()}。\n最近记录（可能省略更早内容）：\n${recent}`, 'flush', 'phone');
+  }
+
   // ───────────────────────── 桥推来的东西 ─────────────────────────
 
   private async onCall(call: BridgeCall): Promise<void> {
@@ -464,6 +470,7 @@ export class PhoneWorld implements World {
       this.lastPhase = '';
       // 记录是**每一通**的账:新的一通进来就换一本(上一本已在 finishCall 里交出去了)。
       this.transcript = [];
+      this.playback = new PlaybackLedger();
       this.unheardStreak = 0;
       this.deafNoticed = false;
     } else {
@@ -628,6 +635,9 @@ export class PhoneWorld implements World {
   private async onConnected(call: BridgeCall): Promise<void> {
     this.segmenter = this.makeSegmenter();
     this.speakGeneration += 1;
+    this.speechAbort.abort();
+    this.speechAbort = new AbortController();
+    this.outputBlocked = false;
     this.speakBuffer = '';
     this.speakQueue = [];
     this.audioQueue = [];
@@ -645,8 +655,7 @@ export class PhoneWorld implements World {
     this.wroteAudioMs = 0;
     this.maxLagMs = 0;
     this.roundMuted = false;
-    this.paceWrittenMs = 0;
-    this.paceStartMs = 0;
+    this.paceEndMs = 0;
     this.unheardStreak = 0;
     this.deafNoticed = false;
     this.startWatch();
@@ -670,6 +679,7 @@ export class PhoneWorld implements World {
       this.ringGraceTimer = undefined;
     }
     this.speakGeneration += 1;
+    this.speechAbort.abort();
     this.speakBuffer = '';
     this.speakQueue = [];
     this.audioQueue = [];
@@ -680,8 +690,7 @@ export class PhoneWorld implements World {
     this.lastUnheardAt = 0;
     this.stalledSinceMs = 0;
     this.roundMuted = false;
-    this.paceWrittenMs = 0;
-    this.paceStartMs = 0;
+    this.paceEndMs = 0;
     this.segmenter = undefined;
     this.current = undefined;
     this.lastPhase = '';
@@ -702,8 +711,8 @@ export class PhoneWorld implements World {
       spoke: stats.spoke,
       announced,
       transcriptLines: transcript.length,
-      // 桥那头到底吃不吃得下:wroteAudioMs 与 callDurationMs 一比就知道(实时的话两者接近),
-      // maxLagMs 是"他听到时已经晚了多久"的峰值。
+      // wroteAudioMs 是成功提交量，通话包含静默，二者不能相除当播放速度。
+      // maxLagMs 是本地排队到写入回执的等待峰值。
       wroteAudioMs: Math.round(this.wroteAudioMs),
       callDurationMs: Math.round(this.now() - this.callStartedMs),
       maxLagMs: Math.round(this.maxLagMs),
@@ -807,35 +816,18 @@ export class PhoneWorld implements World {
       if (remembered && !isTerminal(remembered.phase)) this.finishCall('桥重连后这通已经没了');
       return;
     }
-    if (remembered?.id === live.id) return;
-    this.current = live;
-    this.lastPhase = live.phase;
-    this.callStartedMs = live.inviteAt ?? this.now();
-    // 重连后接手的这一通没有之前的记录,从这儿重新起一本。
-    this.transcript = [];
-    this.unheardStreak = 0;
-    this.deafNoticed = false;
-    if (live.phase === 'ringing') {
-      // 重连/重启之后发现桥那边**正响着**一通:照常走响铃那套(白名单就自动接)。
-      // 没有这一条, World 起来的比来电晚一步就永远接不着 —— 2026-10-09 正是这种情形。
-      this.startWatch();
-      void this.decideRingOnce(live).catch((error: unknown) => this.log.warn?.('处理响铃中的来电出错', { error: describe(error) }));
-      return;
-    }
-    if (live.phase !== 'connected') return;
-    this.segmenter ??= this.makeSegmenter();
-    this.startWatch();
-    void this.note(`桥重连上了，这通还在(${callerOf(live) || '没报出号'})，接着听。`);
+    // hello 与实时 call 走同一生命周期，避免恢复时遗漏端点通知或保留旧音频。
+    void this.onCall(live).catch(error => this.log.warn?.('恢复通话状态失败', { error: describe(error) }));
   }
 
   /** 对方说完一句:送去认字,认出来就当事件给她。 */
   private async hear(pcm: Buffer, ms: number): Promise<void> {
     const call = this.current;
     if (!call) return;
-    const generation = this.speakGeneration;
     this.transcribing += 1;
     try {
       const asr = await transcribe(pcmToWav(pcm, EAR_RATE), this.opts.cfg.asr, this.opts.fetchImpl);
+      if (this.current?.id !== call.id || !this.onCallNow()) return;
       if (!asr) {
         this.log.warn?.('这一句没认出来(识别服务不在或超时)');
         return;
@@ -884,7 +876,6 @@ export class PhoneWorld implements World {
         }
         return;
       }
-      if (this.current?.id !== call.id || generation !== this.speakGeneration) return; // 认字期间这通已经结束了
       this.heard += 1;
       // 认出来一句,前面那一串"没听见"就到此为止。
       this.unheardStreak = 0;
@@ -998,7 +989,9 @@ export class PhoneWorld implements World {
         }
         continue;
       }
-      this.speakQueue.push(sentence);
+      const utterance = this.playback.add(sentence, this.current!.id, this.speakGeneration, this.now());
+      this.speakQueue.push(utterance);
+      this.transcript.push(utterance.line);
       this.saidThisRound.add(speechKey(sentence));
       // 粗估:一个汉字约 0.18 秒。只为把"这一轮说够了"这条闸门算出来，
       // 不参与任何音频计算 —— 真正的时长以合成结果为准。
@@ -1012,142 +1005,162 @@ export class PhoneWorld implements World {
 
   /** 合成走一条链:一句接一句。播放侧独立排空，所以两句之间不会因为等合成而空一拍。 */
   private pumpSynthesis(): void {
-    if (this.synthBusy) return;
+    if (this.synthBusy || !this.onCallNow()) return;
     this.synthBusy = true;
     const generation = this.speakGeneration;
+    const signal = this.speechAbort.signal;
+    const ledger = this.playback;
     void (async () => {
       try {
-        while (this.speakQueue.length > 0 && generation === this.speakGeneration) {
-          const sentence = this.speakQueue.shift();
-          if (sentence === undefined) break;
-          const result = await synthesizePcm(sentence, {
+        while (this.speakQueue.length && generation === this.speakGeneration && this.onCallNow()) {
+          const utterance = this.speakQueue.shift()!;
+          const startedAt = this.now();
+          let first = true;
+          const result = await synthesizePcm(utterance.text, {
             settings: this.opts.cfg.tts,
             apiKey: this.opts.secret(this.opts.cfg.tts.apiKeySecret),
             targetRate: this.bridgeRate,
             fetchImpl: this.opts.fetchImpl,
             log: this.log,
+            signal,
+            onPcm: (pcm) => {
+              if (signal.aborted || generation !== this.speakGeneration) return;
+              if (first) {
+                first = false;
+                this.log.info?.('首段音频可用', { utteranceId: utterance.id, queueWaitMs: startedAt - utterance.queuedAt, firstAudioMs: this.now() - startedAt });
+              }
+              for (const slice of sliceFrames(toChannels(pcm, this.bridgeChannels), this.bridgeRate, this.bridgeChannels, this.opts.cfg.frameMs)) {
+                this.sequence++;
+                ledger.frame(utterance, 'utt-' + utterance.callId + '-' + this.sequence);
+                this.audioQueue.push({ pcm: slice, sequence: this.sequence, atMs: this.now(), utterance });
+              }
+              this.pumpWriter();
+            },
           });
-          if (generation !== this.speakGeneration) return;
+          if (generation !== this.speakGeneration || signal.aborted) return;
+          ledger.finish(utterance, result.ok);
           if (!result.ok) {
-            void this.note(`这句话没念出来:${result.error}`);
+            void this.note(result.error + '。可能已有部分音频提交；没有自动重播整句。');
             continue;
           }
           if (this.opts.cfg.logAudio) this.dumpAudio('out', pcmToWav(result.pcm, result.sampleRate));
-          const stereo = toChannels(result.pcm, this.bridgeChannels);
-          for (const slice of sliceFrames(stereo, this.bridgeRate, this.bridgeChannels, this.opts.cfg.frameMs)) {
-            this.sequence += 1;
-            this.audioQueue.push({ pcm: slice, sequence: this.sequence, atMs: this.now() });
-          }
-          this.spoke += 1;
-          // 记录里只留**真正念出去的**那一句(合成成功的这一句):她写了但被"这一轮说够了"那道闸门
-          // 挡在门外的话没到他耳朵里,写进记录就是假账。
-          this.transcript.push({ who: 'her', text: sentence });
+          this.spoke++;
         }
       } catch (error) {
-        this.log.warn?.('合成这一路出错', { error: describe(error) });
+        if (!signal.aborted) this.log.warn?.('合成这一路出错', { error: describe(error) });
       } finally {
         this.synthBusy = false;
+        if (this.speakQueue.length && this.onCallNow()) this.pumpSynthesis();
       }
     })();
   }
 
-  /** 发送侧:一块一块发，发完等下一块。 */
   private pumpWriter(): void {
-    if (this.writerBusy) return;
+    if (this.writerBusy || this.outputBlocked || !this.onCallNow()) return;
     this.writerBusy = true;
     const generation = this.speakGeneration;
+    const signal = this.speechAbort.signal;
     void (async () => {
       try {
-        while (generation === this.speakGeneration && this.onCallNow()) {
+        while (generation === this.speakGeneration && this.onCallNow() && !this.outputBlocked) {
+          if (this.clearPending) await this.clearPending;
+          if (generation !== this.speakGeneration || this.outputBlocked) break;
           const chunk = this.audioQueue.shift();
-          if (!chunk) {
-            if (!this.synthBusy && this.speakQueue.length === 0) break;
-            await sleep(50);
-            continue;
-          }
-          await this.writeChunk(chunk);
+          if (!chunk) break;
+          await this.writeChunk(chunk, generation, signal);
         }
+      } catch (error) {
+        if (!signal.aborted) this.log.warn?.('发送音频出错', { error: describe(error) });
       } finally {
         this.writerBusy = false;
+        if (this.audioQueue.length && this.onCallNow() && !this.outputBlocked) this.pumpWriter();
       }
     })();
   }
 
-  private async writeChunk(chunk: AudioChunk): Promise<void> {
+  private async writeChunk(chunk: AudioChunk, generation: number, signal: AbortSignal): Promise<void> {
     const call = this.current;
     const bridge = this.bridge;
-    if (!call || !bridge || call.phase !== 'connected') return;
-    const frame = {
-      callId: call.id,
-      encoding: 'pcm_s16le',
-      sampleRate: this.bridgeRate,
-      channels: this.bridgeChannels,
-      sequence: chunk.sequence,
-      timestamp: this.now(),
-      data: chunk.pcm.toString('base64'),
-    };
-    const reply = await bridge.request('audio.write', {
-      callId: call.id,
-      playbackId: `utt-${call.id}-${chunk.sequence}`,
-      frame,
-    });
+    if (!call || !bridge || call.phase !== 'connected' || signal.aborted) return;
     const ms = durationMs(chunk.pcm, this.bridgeRate, this.bridgeChannels);
-    // 记一笔"他听到的时候已经晚了多久"。**不做任何丢弃**:
-    // 2026-10-09 他定过规矩 —— 宁可晚、不可丢,听不下去时他自己喊「停」让她收(phone_stop)。
-    // (我们试过自动丢:按块丢是"一个字卡一下"的碎片,整句丢是"她少说了半句",两种他都不接受。)
+    // 只计算尚未经过的播放时间。静默不积攒额度；发送之前留出空间。
+    const waitMs = Math.max(0, this.paceEndMs + ms - this.now() - Math.max(PACE_LEAD_MS, ms));
+    if (waitMs > 0) await this.waitAudio(waitMs, signal);
+    if (signal.aborted || generation !== this.speakGeneration) return;
+    const id = 'utt-' + call.id + '-' + chunk.sequence;
+    const ledger = this.playback;
+    if (!chunk.utterance.frames.has(id)) ledger.frame(chunk.utterance, id);
+    const sentAt = this.now();
+    const reply = await bridge.request('audio.write', {
+      callId: call.id, playbackId: id,
+      frame: { callId: call.id, encoding: 'pcm_s16le', sampleRate: this.bridgeRate,
+        channels: this.bridgeChannels, sequence: chunk.sequence, timestamp: this.now(), data: chunk.pcm.toString('base64') },
+    }, { signal });
+    if (signal.aborted || generation !== this.speakGeneration || this.current?.id !== call.id) return;
     this.maxLagMs = Math.max(this.maxLagMs, this.now() - chunk.atMs);
     if (!reply.ok) {
-      // 中断、通话刚结束、静音这类都不算故障，记一条就够，别反复喊。
       this.log.info?.('这一块音频没写进去', { code: reply.error?.code, message: reply.error?.message });
       if (reply.error?.message?.includes('queue is full')) {
-        // 队列满不是故障,是"放不下了"。**把这块放回队首、等一会儿重试** ——
-        // 宁可晚一点,不能丢:2026-10-09 实测这一路把她一整句里的 2.4 秒丢掉了,
-        // 他听感上就是"她说了半句"。
-        if (this.stalledSinceMs === 0) this.stalledSinceMs = this.now();
-        const stalledMs = this.now() - this.stalledSinceMs;
-        // 提醒**一通只说一次**,而且要等它真卡住(几帧的抖动不用惊动她 ——
-        // 2026-10-10 实测:上一版按"每次重新开始卡"报,一通里报了三十几次,她上下文被刷屏)。
-        if (!this.stallNoticed && stalledMs >= STALL_NOTICE_MS) {
+        if (!this.stalledSinceMs) this.stalledSinceMs = this.now();
+        if (!this.stallNoticed && this.now() - this.stalledSinceMs >= STALL_NOTICE_MS) {
           this.stallNoticed = true;
-          this.log.warn?.('桥那头的播放一直跟不上', { stalledMs: Math.round(stalledMs) });
-          void this.note('桥那头放得很慢(播放队列一直满):你的话会晚一会儿才到他耳朵里,可能堆积。要恢复多半得重启云上那个 AV Host;他喊停时你调 phone_stop 就能把堆着的收掉。');
-        }
-        if (stalledMs > STALL_GIVE_UP_MS) {
-          // 卡了这么久还没排空:桥那头是真堵住了,这一块就别粘着,让后面的先走。
-          this.stalledSinceMs = 0;
-          this.log.warn?.('桥那条播放队列一直满着，这一块不重试了', { sequence: chunk.sequence });
-          return;
+          void this.note('桥的音频队列持续满，正在保留原音频等待重试；需要停止时调 phone_stop。');
         }
         this.audioQueue.unshift(chunk);
-        await sleep(300);
+        await this.waitAudio(300, signal);
         return;
       }
+      // 没回执可能已经播了：保留这一块并暂停，绝不换 id 盲目重播或静默跳过。
+      ledger.receipt({ id, callId: call.id, state: 'uncertain' });
+      this.audioQueue.unshift(chunk);
+      this.outputBlocked = true;
+      void this.note('音频发送未获确认，已暂停后续发送并保留队列：' + whyFailed(reply) + '。可能已经播出部分；可用 phone_stop 清理后再说。');
       return;
     }
-    // 注意:**别在这里再加一次时长**。这条闸门的口径是"本轮排了多少话"(入队时按 180ms/字估),
-    // 两边都加就等于算两倍 —— 2026-10-09 实测过:他 30 秒的配置在真实说话约 15 秒时就合上了闸门,
-    // 之后**整通电话她都不再出声,而控制台照旧显示正文**(他"看得到回复听不到声"就是这个)。
-    if (this.stalledSinceMs !== 0) {
-      this.log.info?.('桥那头又能出声了', { stalledMs: Math.round(this.now() - this.stalledSinceMs) });
+    const receipt = reply.data as { state?: string } | undefined;
+    ledger.receipt({ id, callId: call.id, state: receipt?.state ?? 'queued' });
+    this.paceEndMs = Math.max(this.paceEndMs, this.now()) + ms;
+    this.wroteAudioMs += ms;
+    this.log.info?.('音频块提交', { sequence: chunk.sequence, audioMs: Math.round(ms), queuedMs: this.now() - chunk.atMs, replyMs: this.now() - sentAt });
+    if (this.stalledSinceMs) {
+      this.log.info?.('桥重新接受音频', { stalledMs: this.now() - this.stalledSinceMs });
       this.stalledSinceMs = 0;
     }
-    this.wroteAudioMs += ms;
-    await this.pace(ms);
   }
 
-  /**
-   * 按播放的速度往外写,只领先 `PACE_LEAD_MS` 就等一等。
-   *
-   * 为什么:桥那边的播放队列**上限 2000 毫秒**(上游 `bridge/audio/common.mjs` 的
-   * `maxQueueMs: 2000`),它是给抖动用的缓冲,不是给人塞一整句的。我们以前一口气把整句灌进去:
-   * 2026-10-09 实测她 50 字那一句(5.6 秒)有 **7 块 ≈2.8 秒**被"Audio output queue is full"丢掉 ——
-   * 听感上就是"她说了一半没了"。配速之后队列里始终只压着一秒多,一句都不会丢。
-   */
-  private async pace(ms: number): Promise<void> {
-    if (this.paceStartMs === 0) this.paceStartMs = this.now();
-    this.paceWrittenMs += ms;
-    const ahead = this.paceWrittenMs - (this.now() - this.paceStartMs);
-    if (ahead > PACE_LEAD_MS) await sleep(Math.min(ahead - PACE_LEAD_MS, 1000));
+  private waitAudio(ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    return new Promise(resolve => {
+      const done = (): void => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+      const timer = setTimeout(done, ms);
+      signal.addEventListener('abort', done, { once: true });
+    });
+  }
+
+  private async clearSpeech(): Promise<boolean> {
+    this.speakGeneration++;
+    this.speechAbort.abort();
+    this.speechAbort = new AbortController();
+    this.speakQueue = [];
+    this.audioQueue = [];
+    this.speakBuffer = '';
+    this.playback.interrupt();
+    this.paceEndMs = 0;
+    const callId = this.current?.id;
+    if (!callId) return true;
+    const generation = this.speakGeneration;
+    let ok = false;
+    const previous = this.clearPending;
+    const pending = (async () => {
+      if (previous) await previous;
+      const reply = await this.send('audio.clear', { callId });
+      ok = reply.ok;
+      if (generation === this.speakGeneration) this.outputBlocked = !ok;
+      if (!ok) this.log.warn?.('桥端停止未确认', { code: reply.error?.code, message: reply.error?.message });
+    })();
+    this.clearPending = pending;
+    try { await pending; return ok; }
+    finally { if (this.clearPending === pending) this.clearPending = undefined; this.pumpWriter(); }
   }
 
   /**
@@ -1158,14 +1171,9 @@ export class PhoneWorld implements World {
    */
   private async bargeIn(): Promise<void> {
     if (!this.herAudioActive()) return;
-    this.speakGeneration += 1;
-    this.speakQueue = [];
-    this.audioQueue = [];
-    this.speakBuffer = '';
     this.preemptArmed = true;
-    const reply = await this.send('audio.clear', { callId: this.current?.id });
-    if (!reply.ok) this.log.info?.('清队列没成功(多半是已经没在放了)', { message: reply.error?.message });
-    this.pumpWriter();
+    const ok = await this.clearSpeech();
+    if (!ok) void this.note('本地已停止，桥端清队列未确认，可能仍有声音。');
   }
 
   // ───────────────────────── 看护与自愈 ─────────────────────────
@@ -1266,9 +1274,7 @@ export class PhoneWorld implements World {
     return {
       name: 'phone_say',
       description:
-        '**在通话里说一句话给他听**(你那句话会被念出来)。通话中要开口就用它:说一句调一次,' +
-        '想多说就分几次调。这是说话,不是通知 —— 调一次他就真听见一句。' +
-        '现在没有接通的话时会明确告诉你"这一句没有被念出去"。',
+        '在已接通的电话里说话。text 只放要念的短句；回执确认进入合成队列，不代表已经播放或对方听见。没接通或本轮已停止时失败。',
       tags: ['speak'],
       parameters: {
         type: 'object',
@@ -1313,7 +1319,7 @@ export class PhoneWorld implements World {
         }
         const fresh = all.filter((s) => !this.saidThisRound.has(speechKey(s)));
         if (fresh.length === 0) {
-          return `这一句这一轮已经说过了,不念第二遍:「${all[0]}」。`;
+          return `这一句这一轮已经提交过,不重复入队:「${all[0]}」。`;
         }
 
         const { queued, capped } = this.enqueue(fresh);
@@ -1328,7 +1334,7 @@ export class PhoneWorld implements World {
         const est = Math.round((fresh.slice(0, queued).reduce((n, s) => n + s.length, 0) * 180) / 1000);
         const parts = [`已经交给合成念了:「${fresh[0]}」`];
         if (queued > 1) parts.push(`(这一句被切成 ${queued} 段,一起念出去)`);
-        parts.push(`,念完大约 ${est} 秒。`);
+        parts.push(`,预计音频约 ${est} 秒（不含排队和合成等待），尚未确认播放。`);
         if (capped) parts.push('**后面那几段被"这一轮说够了"挡下了,他没听到** —— 想接着说等他再开口。');
         parts.push('合成要是没成,我会单独告诉你一句。');
         return parts.join('');
@@ -1458,18 +1464,13 @@ export class PhoneWorld implements World {
         '对方说「停」「停停停」「先别说了」这类意思时调它。调完这一轮就安静下来,下一次他开口你照常能说。',
       tags: ['act'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
-      handler: async (): Promise<string> => {
-        const stopped = this.herAudioActive();
+      handler: async (): Promise<string | ToolOutcome> => {
+        const hadCall = !!this.current;
         this.roundMuted = true;
-        this.speakGeneration += 1;
-        this.speakQueue = [];
-        this.audioQueue = [];
-        this.speakBuffer = '';
-        if (this.current && stopped) await this.send('audio.clear', { callId: this.current.id });
-        this.pumpWriter();
-        return stopped
-          ? '已经停下了(没念完的收掉了)。这一轮我不再出声,等他再开口。'
-          : '这一轮本来就没在念;我保持安静,等他再开口。';
+        const ok = await this.clearSpeech();
+        if (!hadCall) return '现在没有通话，本地合成和待发音频已清理。';
+        return ok ? '本地合成和待发音频已停，桥已确认清队列。这一轮不再出声。' :
+          { text: '本地合成和待发音频已停，但桥端清队列失败，不能确认远端已安静；后续发送暂停，可再次 phone_stop。', failed: true };
       },
     };
   }
@@ -1477,7 +1478,7 @@ export class PhoneWorld implements World {
   private statusTool(): ToolDef {
     return {
       name: 'phone_status',
-      description: '现在电话这一路的实况:有没有通话、对方是谁、已经多久、桥通不通、你这一通说了多少。',
+      description: '现在电话这一路的实况:有没有通话、对方是谁、已经多久、桥通不通、合成和播放各确认到哪一步。',
       tags: ['read'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       handler: async (): Promise<string> => {
@@ -1488,7 +1489,7 @@ export class PhoneWorld implements World {
           describeLive(call, this.now(), this.bridgeOnline ? '' : this.bridgeNote),
           this.bridgeOnline ? '桥连着。' : `桥没连着:${this.bridgeNote}`,
           `接听名单:${this.opts.cfg.callers.map((c) => String(c)).join('、') || '(没配，谁都不接)'}`,
-          call ? `这一通已 ${since}，听到对方 ${this.heard} 句，你出声 ${this.spoke} 段。` : '',
+          call ? `这一通已 ${since}，听到对方 ${this.heard} 句，完整合成 ${this.spoke} 段；${this.playback.summary()}。` : '',
           typeof noise === 'number' ? `环境噪声底约 ${noise.toFixed(0)} dBFS。` : '',
           this.tunnel ? '隧道由这一路自己看着。' : '',
         ].filter((s) => s !== '');
@@ -1548,7 +1549,7 @@ export class PhoneWorld implements World {
 
   /** 她手上还有没有没放完的声音(抢话判据)。 */
   private herAudioActive(): boolean {
-    return this.audioQueue.length > 0 || this.speakQueue.length > 0 || this.synthBusy || this.speakBuffer.trim() !== '';
+    return this.playback.pending || this.audioQueue.length > 0 || this.speakQueue.length > 0 || this.synthBusy || this.speakBuffer.trim() !== '';
   }
 
   /** 这一句要不要用 `preempt` 投(接了抢话那一脚)。 */

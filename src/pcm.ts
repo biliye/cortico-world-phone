@@ -12,6 +12,38 @@
 /** 每个样本的字节数。 */
 const SAMPLE_BYTES = 2;
 
+/** 流式线性重采样：跨网络块保留插值相位，块边界不补零、不重复尾样本。 */
+export class StreamingMonoResampler {
+  private pending: Buffer = Buffer.alloc(0);
+  private base = 0;
+  private output = 0;
+  constructor(private readonly from: number, private readonly to: number) {
+    if (!(from > 0 && to > 0)) throw new Error('Invalid sample rate');
+  }
+  push(pcm: Buffer, final = false): Buffer {
+    this.pending = Buffer.concat([this.pending, pcm]);
+    if (final && this.pending.length % 2) throw new Error('Incomplete PCM sample');
+    const count = Math.floor(this.pending.length / 2);
+    const total = this.base + count;
+    const limit = final ? Math.round(total * this.to / this.from) : Math.ceil(Math.max(0, total - 1) * this.to / this.from);
+    const out = Buffer.alloc(Math.max(0, limit - this.output) * 2);
+    let offset = 0;
+    while (this.output < limit) {
+      const pos = this.output * this.from / this.to;
+      const lo = Math.floor(pos);
+      const a = this.pending.readInt16LE(Math.min(count - 1, lo - this.base) * 2);
+      const b = this.pending.readInt16LE(Math.min(count - 1, lo + 1 - this.base) * 2);
+      out.writeInt16LE(Math.round(a + (b - a) * (pos - lo)), offset);
+      offset += 2;
+      this.output++;
+    }
+    const discard = Math.max(0, Math.min(count - 1, Math.floor(this.output * this.from / this.to) - this.base));
+    this.pending = Buffer.from(this.pending.subarray(discard * 2));
+    this.base += discard;
+    return out;
+  }
+}
+
 /** 交错多声道 → 单声道(按声道求平均)。 */
 export function downmixToMono(pcm: Buffer, channels: number): Buffer {
   if (channels <= 1) return pcm;

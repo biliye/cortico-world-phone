@@ -130,10 +130,11 @@ export function describeConnected(call: BridgeCall): string {
   );
 }
 
-/** 通话记录里的一行。`him` = 对方说的(识别出来的正文),`her` = 她真正念出去的句子。 */
+/** 通话记录里的一行。`him` = 对方说的(识别出来的正文),`her` = 她提交的句子，播放状态另列。 */
 export interface TranscriptLine {
   who: 'him' | 'her';
   text: string;
+  playback?: string;
 }
 
 /**
@@ -153,7 +154,7 @@ export function renderTranscript(lines: readonly TranscriptLine[]): string {
   let cut = 0;
   for (const line of lines) {
     const who = line.who === 'her' ? '她' : '他';
-    const row = `${who}：${line.text.replace(/\s+/g, ' ').trim()}`;
+    const row = `${who}${line.playback ? `（${line.playback}）` : ''}：${line.text.replace(/\s+/g, ' ').trim()}`;
     if (used + row.length > TRANSCRIPT_MAX_CHARS) {
       cut += 1;
       continue;
@@ -185,11 +186,11 @@ export function describeEnded(
   const who = callerOf(call) || '没报出号';
   const end = call.endedAt ?? Date.now();
   const seconds = Math.max(0, (end - (call.inviteAt ?? end))) / 1000;
-  const native = call.nativeEndEvent ? `,原生结束事件 ${call.nativeEndEvent}` : '';
+  const native = call.nativeEndEvent ? `,桥报结束信息 ${call.nativeEndEvent}` : '';
   const odd = reason === '正常结束' ? '' : `,我们这边看到的收尾原因是「${reason}」`;
   return (
     `【电话】通话结束:${who},历时 ${humanSeconds(seconds)}${native}${odd}。` +
-    `这一通里你听到了对方 ${stats.heard} 句,你出声 ${stats.spoke} 段。` +
+    `这一通里收到对方 ${stats.heard} 条语音事件,你完整合成 ${stats.spoke} 段。播放情况见逐句标记；桥确认完成也不代表对方实际听见。` +
     renderTranscript(transcript)
   );
 }

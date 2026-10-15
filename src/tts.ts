@@ -11,8 +11,11 @@
 import { describe, type VoiceLoggerLike } from './util.ts';
 import { billableChars } from './sentences.ts';
 import { downmixToMono, parseWav, resampleMono } from './pcm.ts';
+import { synthesizeStreamingPcm } from './tts-stream.ts';
 
 export interface TtsSettings {
+  /** 缺省开启；false 保留整句 WAV 路径。 */
+  streaming?: boolean;
   /** 密钥的环境变量名，只用来在报错时把话说明白。 */
   apiKeySecret: string;
   endpoint: string;
@@ -47,6 +50,8 @@ export interface TtsFail {
 export type TtsResult = TtsOk | TtsFail;
 
 export interface TtsDeps {
+  signal?: AbortSignal;
+  onPcm?: (pcm: Buffer) => void;
   settings: TtsSettings;
   /** 密钥;空串 = 没配(回执里要说清缺什么)。 */
   apiKey: string;
@@ -93,6 +98,8 @@ export async function synthesizePcm(text: string, deps: TtsDeps): Promise<TtsRes
     };
   }
 
+  if (deps.onPcm && settings.streaming !== false) return synthesizeStreamingPcm(text, deps);
+  const startedAt = Date.now();
   const body = {
     model: settings.model,
     text,
@@ -118,7 +125,7 @@ export async function synthesizePcm(text: string, deps: TtsDeps): Promise<TtsRes
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Math.max(1000, settings.timeoutMs)),
+      signal: AbortSignal.any([AbortSignal.timeout(Math.max(1000, settings.timeoutMs)), ...(deps.signal ? [deps.signal] : [])]),
     });
     http = res.status;
     payload = (await res.json()) as MiniMaxResponse;
@@ -190,5 +197,8 @@ export async function synthesizePcm(text: string, deps: TtsDeps): Promise<TtsRes
   }
 
   deps.log?.info?.('合成好了', { chars, bytes: pcm.length, rate: deps.targetRate, voice: settings.voiceId });
+  deps.signal?.throwIfAborted();
+  deps.onPcm?.(pcm);
+  deps.log?.info?.('语音合成计时', { streaming: false, firstAudioMs: Date.now() - startedAt, totalMs: Date.now() - startedAt });
   return { ok: true, pcm, sampleRate: deps.targetRate, ms: (pcm.length / 2 / deps.targetRate) * 1000, chars };
 }

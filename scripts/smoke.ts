@@ -100,7 +100,7 @@ async function main(): Promise<void> {
     stuckSec: 1,
     // 拨号目标配着:冒烟里要能真把那条 `dial` 帧发出去。
     dial: { target: ME, label: '他' },
-    tts: { ...PHONE_DEFAULTS.tts, voiceId: 'smoke-voice' },
+    tts: { ...PHONE_DEFAULTS.tts, streaming: false, voiceId: 'smoke-voice' },
   };
   const world = new PhoneWorld({
     cfg,
@@ -167,7 +167,7 @@ async function main(): Promise<void> {
   // 收尾要把**这一通说过的话**打包给她(他要的"通话记录"),而不是只留一个"历时多久"。
   check(
     '收尾的正文里带着逐句记录',
-    ended.text.includes('这一通的记录') && ended.text.includes('他：') && ended.text.includes('她：'),
+    ended.text.includes('这一通的记录') && ended.text.includes('他：') && ended.text.includes('她（'),
   );
 
   // ⑥ 工具回执

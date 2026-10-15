@@ -33,6 +33,7 @@ if (key === '') {
 }
 
 const settings: TtsSettings = {
+  streaming: process.argv.includes('--stream'),
   apiKeySecret: 'MINIMAX_API_KEY',
   endpoint,
   model: arg('model') ?? 'speech-2.8-turbo',
@@ -50,10 +51,13 @@ console.log(`音色 : ${voiceId}`);
 console.log(`模型 : ${settings.model}`);
 
 const started = Date.now();
+let firstAudioMs: number | undefined;
+let chunks = 0;
 const result = await synthesizePcm('喂,听得见吗?我这边测试一下嗓子。', {
   settings,
   apiKey: key,
   targetRate: 48000,
+  onPcm: () => { firstAudioMs ??= Date.now() - started; chunks++; },
   log: { info: (m, meta) => console.log('  info', m, meta ?? ''), warn: (m, meta) => console.log('  warn', m, meta ?? '') },
 });
 const spent = Date.now() - started;
@@ -68,5 +72,6 @@ if (!result.ok) {
   console.log(`  音频时长(按桥要的 48k 单声道算) ${Math.round(result.ms)} 毫秒`);
   console.log(`  重采样后的字节数 ${result.pcm.length}(48k × 16 位 × 1 声道 ⇒ 约 ${Math.round(result.pcm.length / 2 / 48000)} 秒)`);
   console.log(`  计费字符数 ${result.chars}(一个汉字算 2)`);
-  console.log('  文件头与自报时长已交叉核对过(不合就会在这里报失败)。');
+  console.log(`  首块 ${firstAudioMs} 毫秒，${chunks} 个音频块，流式=${settings.streaming}`);
+  console.log(settings.streaming ? '  已收到流式完成标志；音频只在内存中计数，未播放或保存。' : '  WAV 文件头与自报时长已交叉核对。');
 }

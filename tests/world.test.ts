@@ -63,7 +63,7 @@ function fakeServices(options: { herSpeech?: Buffer; speakDelayMs?: number; asrT
   }) as typeof fetch;
 }
 
-async function startWorld(over: Partial<PhoneConfigSection> = {}, services = fakeServices()): Promise<FakeHost> {
+async function startWorld(over: Partial<PhoneConfigSection> = {}, services = fakeServices(), now?: () => number): Promise<FakeHost> {
   bridge = new FakeBridge(TOKEN);
   const url = await bridge.listen();
   const cfg: PhoneConfigSection = {
@@ -72,7 +72,7 @@ async function startWorld(over: Partial<PhoneConfigSection> = {}, services = fak
     bridgeUrl: url,
     tokenSecret: 'TEST_PHONE_TOKEN',
     callers: [HIM],
-    tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+    tts: { ...PHONE_DEFAULTS.tts, streaming: false, voiceId: 'test-voice' },
     ...over,
   };
   world = new PhoneWorld({
@@ -81,6 +81,7 @@ async function startWorld(over: Partial<PhoneConfigSection> = {}, services = fak
     dataDir: scratch,
     secret: () => TOKEN,
     fetchImpl: services,
+    now,
   });
   const host = new FakeHost();
   await world.start(host);
@@ -159,6 +160,120 @@ describe('干装载与声明', () => {
   });
 });
 
+describe('实机复核的回归边界', () => {
+  it('队列满超过旧的 20 秒截止线，仍重试原块而不跳到下一块', async () => {
+    let offset = 0;
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(800, 32000) }), () => Date.now() + offset);
+    await connect(host);
+    bridge!.onRequest = op => op === 'audio.write' ? { ok: false, error: { code: 'FULL', message: 'Audio output queue is full.' } } : undefined;
+    await callTool('phone_say', { text: '不自动丢掉。' });
+    const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
+    await waitFor(() => writes().length >= 2);
+    offset = 25000;
+    await waitFor(() => writes().length >= 4);
+    expect(new Set(writes().map(r => (r.args.frame as { sequence: number }).sequence)).size).toBe(1);
+  });
+  it('静默后开始长句，也不会积累可突发发送的额度', async () => {
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(2400, 32000) }));
+    await connect(host);
+    const writes = () => bridge!.requests.filter(r => r.op === 'audio.write').length;
+    await callTool('phone_say', { text: '第一句。' });
+    await waitFor(() => writes() === 6);
+    // 等前句播放完并留下静默，旧实现会一次塞入新句的几乎全部帧。
+    await new Promise(r => setTimeout(r, 1600));
+    world!.outputTap()!.onEvent({ type: 'response.created' } as never);
+    const before = writes();
+    await callTool('phone_say', { text: '第二句。' });
+    await new Promise(r => setTimeout(r, 550));
+    expect(writes() - before).toBeLessThanOrEqual(3);
+  });
+  it('本地队列已空但桥仅确认 queued，停止仍清桥；失败如实返回', async () => {
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(100, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '你好。' });
+    await waitFor(() => bridge!.requests.some(r => r.op === 'audio.write'));
+    await new Promise(r => setTimeout(r, 80));
+    bridge!.onRequest = op => op === 'audio.clear' ? { ok: false, error: { code: 'FAIL', message: 'clear failed' } } : undefined;
+    const stop = await callTool('phone_stop');
+    expect(stop.failed).toBe(true);
+    expect(stop.text).toContain('不能确认');
+    expect(bridge!.requests.some(r => r.op === 'audio.clear')).toBe(true);
+    bridge!.onRequest = undefined;
+    expect((await callTool('phone_stop')).failed).toBe(false);
+  });
+  it('停止取消未回执的 write，迟到的失败不能让旧块回到队列', async () => {
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(800, 32000) }));
+    await connect(host);
+    bridge!.holdOps.add('audio.write');
+    await callTool('phone_say', { text: '旧句。' });
+    await waitFor(() => bridge!.requests.some(r => r.op === 'audio.write'));
+    await callTool('phone_stop');
+    bridge!.holdOps.delete('audio.write');
+    world!.outputTap()!.onEvent({ type: 'response.created' } as never);
+    await callTool('phone_say', { text: '新句。' });
+    await waitFor(() => bridge!.requests.filter(r => r.op === 'audio.write').length === 3, 3000);
+    expect((await callTool('phone_status')).text).not.toContain('发送结果不明');
+  });
+  it('交接补当前通话和近期记录，不另建会话、不把 queued 当 played', async () => {
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(100, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '留在同一通。' });
+    await waitFor(() => bridge!.requests.some(r => r.op === 'audio.write'));
+    await new Promise(r => setTimeout(r, 40));
+    world!.onHandoffEnded();
+    await waitFor(() => host.events.some(e => e.type === 'phone.context'));
+    const context = host.events.find(e => e.type === 'phone.context')!;
+    expect(context.text).toContain('留在同一通');
+    expect(context.text).toContain('播放未确认');
+    expect(context.text).not.toContain('桥确认播放完成');
+  });
+  it('真实形状的播放回执更新逐句记录，旧 callId 的回执不算', async () => {
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(100, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '播放证据。' });
+    await waitFor(() => bridge!.requests.some(r => r.op === 'audio.write'));
+    const args = bridge!.requests.find(r => r.op === 'audio.write')!.args;
+    bridge!.push({ type: 'playback', receipt: { id: args.playbackId, callId: args.callId, state: 'played' } });
+    await waitFor(() => (world!.envPromptVars()['phone.state'] ?? '').includes('通话中'));
+    await new Promise(r => setTimeout(r, 40));
+    bridge!.setPhase('c1', 'ended');
+    await waitFor(() => host.events.some(e => e.type === 'phone.ended'));
+    expect(host.events.find(e => e.type === 'phone.ended')!.text).toContain('她（桥确认播放完成）：播放证据。');
+  });
+  it('只播完第一块时，不把尚在本地队列的长句误记为全部完成', async () => {
+    const host = await startWorld({}, fakeServices({ herSpeech: tone(2000, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '这句话还有后半段。' });
+    await waitFor(() => bridge!.requests.some(r => r.op === 'audio.write'));
+    const a = bridge!.requests.find(r => r.op === 'audio.write')!.args;
+    bridge!.push({ type: 'playback', receipt: { id: a.playbackId, callId: a.callId, state: 'played' } });
+    await new Promise(r => setTimeout(r, 50));
+    expect((await callTool('phone_status')).text).not.toContain('桥确认播放完成 1 段');
+  });
+  it('SSE 首块在结束包到达前进入桥，停止后流不能再喂旧音频', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let aborted = false;
+    const services = (async (_url, init) => {
+      const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; } });
+      init!.signal!.addEventListener('abort', () => { aborted = true; });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    }) as typeof fetch;
+    const host = await startWorld({ tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test', streaming: true } }, services);
+    await connect(host);
+    await callTool('phone_say', { text: '流式测试。' });
+    await waitFor(() => !!controller);
+    controller.enqueue(Buffer.from('data: ' + JSON.stringify({ data: { status: 1, audio: tone(200, 32000).toString('hex') } }) + '\n\n'));
+    await waitFor(() => bridge!.requests.some(r => r.op === 'audio.write'));
+    expect((await callTool('phone_status')).text).toContain('完整合成 0 段');
+    await callTool('phone_stop');
+    expect(aborted).toBe(true);
+    controller.enqueue(Buffer.from('data: {"data":{"status":2}}\n\n'));
+    controller.close();
+    await new Promise(r => setTimeout(r, 50));
+    expect(bridge!.requests.filter(r => r.op === 'audio.write')).toHaveLength(1);
+  });
+});
+
 describe('来电 → 接起 → 听见 → 她说话 → 挂断', () => {
   it('白名单来电自动接起,接通后投 phone.connected', async () => {
     const host = await startWorld();
@@ -213,7 +328,7 @@ describe('来电 → 接起 → 听见 → 她说话 → 挂断', () => {
     const ended = host.events.find((e) => e.type === 'phone.ended')!;
     expect(ended.text).toContain('通话结束');
     expect(ended.text).toContain(String(HIM));
-    expect(ended.text).toContain('你听到了对方 1 句');
+    expect(ended.text).toContain('收到对方 1 条语音事件');
   });
 });
 
@@ -282,7 +397,7 @@ describe('规矩', () => {
       bridgeUrl: url,
       tokenSecret: 'TEST_PHONE_TOKEN',
       callers: [HIM],
-      tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+      tts: { ...PHONE_DEFAULTS.tts, streaming: false, voiceId: 'test-voice' },
     };
     world = new PhoneWorld({
       cfg,
@@ -451,9 +566,9 @@ describe('规矩', () => {
     bridge!.ring('c1', String(HIM));
     await waitFor(() => bridge!.calls.get('c1')?.state === 'connected');
     world!.outputTap()!.onEvent({ type: 'response.output_text.delta', delta: '我说一句。' } as never);
-    await waitFor(() => host.events.some((e) => e.text.includes('放得很慢')), 10000, '那一声提醒');
+    await waitFor(() => host.events.some((e) => e.text.includes('音频队列持续满')), 10000, '那一声提醒');
     await new Promise((r) => setTimeout(r, 1200));
-    expect(host.events.filter((e) => e.text.includes('放得很慢'))).toHaveLength(1);
+    expect(host.events.filter((e) => e.text.includes('音频队列持续满'))).toHaveLength(1);
   });
 
   it('通话卡在 rejecting 太久:报出来,并说清自愈命令没配', async () => {
@@ -606,7 +721,7 @@ describe('phone_say:她自己开口(2026-10-14 补的那条路)', () => {
 
     const receipt = await callTool('phone_say', { text: '我在呢。' });
     expect(receipt.failed).toBe(false);
-    expect(receipt.text).toContain('已经说过');
+    expect(receipt.text).toContain('已经提交过');
     await new Promise((r) => setTimeout(r, 500));
     expect(writes()).toBe(afterProse);
 
@@ -683,8 +798,8 @@ describe('phone_say:她自己开口(2026-10-14 补的那条路)', () => {
     bridge!.setPhase('c1', 'ended');
     await waitFor(() => host.events.some((e) => e.type === 'phone.ended'));
     const ended = host.events.find((e) => e.type === 'phone.ended')!;
-    expect(ended.text).toContain('你出声 1 段');
-    expect(ended.text).toContain('她：我在呢。');
+    expect(ended.text).toContain('完整合成 1 段');
+    expect(ended.text).toContain('我在呢。');
   });
 });
 
@@ -758,7 +873,7 @@ describe('三处实测踩出来的规矩(2026-10-09 他打过来"被拒绝 / 打
       bridgeUrl: url,
       tokenSecret: 'TEST_PHONE_TOKEN',
       callers: [HIM],
-      tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+      tts: { ...PHONE_DEFAULTS.tts, streaming: false, voiceId: 'test-voice' },
     };
     world = new PhoneWorld({ cfg, timezone: 'Asia/Shanghai', dataDir: scratch, secret: () => TOKEN, fetchImpl: fakeServices() });
     const host = new FakeHost();
@@ -837,7 +952,7 @@ describe('World 比来电晚一步也能接上(2026-10-09 栽过的那个坑)', 
       bridgeUrl: url,
       tokenSecret: 'TEST_PHONE_TOKEN',
       callers: [HIM],
-      tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test-voice' },
+      tts: { ...PHONE_DEFAULTS.tts, streaming: false, voiceId: 'test-voice' },
     };
     world = new PhoneWorld({ cfg, timezone: 'Asia/Shanghai', dataDir: scratch, secret: () => TOKEN, fetchImpl: fakeServices() });
     const host = new FakeHost();
@@ -989,7 +1104,7 @@ describe('通话记录:挂断时把两边说过的话打包给她', () => {
     const ended = host.events.find((e) => e.type === 'phone.ended')!;
     expect(ended.text).toContain('这一通的记录');
     expect(ended.text).toContain('他：你吃饭了吗');
-    expect(ended.text).toContain('她：吃了，你呢。');
+    expect(ended.text).toContain('吃了，你呢。');
   });
 
   it('没念出去的话不进记录 —— 记录是"他真听到的",不是"她写了什么"', async () => {

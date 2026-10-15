@@ -24,6 +24,7 @@ export interface PhoneVadSection {
 
 /** 嗓子(MiniMax 合成)那一段。密钥名写在这里，值住部署 .env。 */
 export interface PhoneTtsSection {
+  streaming?: boolean;
   apiKeySecret: string;
   endpoint: string;
   model: string;
@@ -173,6 +174,7 @@ export const PHONE_DEFAULTS: PhoneConfigSection = {
     maxSegmentMs: 15000,
   },
   tts: {
+    streaming: true,
     apiKeySecret: 'MINIMAX_API_KEY',
     endpoint: 'https://api.minimax.chat/v1/t2a_v2',
     model: 'speech-2.8-turbo',
@@ -328,6 +330,12 @@ export const PHONE_CONFIG_GROUP: ConfigGroup = {
         type: 'string',
         title: '音色',
         description: 'MiniMax 的 voice_id；空着合成会失败并告诉你。',
+        'x-hot': true,
+      },
+      'worlds.phone.tts.streaming': {
+        type: 'boolean',
+        title: '流式语音合成',
+        description: '收到音频块就开始发送；关闭可退回整句 WAV 兼容模式。',
         'x-hot': true,
       },
       'worlds.phone.tts.speed': {

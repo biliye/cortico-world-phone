@@ -193,7 +193,9 @@ describe('事件正文', () => {
     );
     expect(text).toContain('1 分 35 秒');
     expect(text).toContain('peer.hangup');
-    expect(text).toContain('你听到了对方 7 句');
+    expect(text).toContain('收到对方 7 条语音事件');
+    expect(text).toContain('完整合成 3 段');
+    expect(text).toContain('不代表对方实际听见');
   });
 
   it('没有桥报的结束时,把我们这边看到的原因补进去(不冒充事实)', () => {

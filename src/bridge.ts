@@ -149,7 +149,7 @@ export function normalizeCall(raw: unknown): BridgeCall | null {
     media: str(r.media),
     muted: r.muted === true,
     // 原生结束原因:插件口叫 `nativeEndEvent`,守护进程那一侧叫 `endReason`。
-    nativeEndEvent: str(r.nativeEndEvent) ?? str(r.endReason),
+    nativeEndEvent: str(r.nativeEndEvent) ?? str(r.endReason) ?? str(r.error),
     raw: r,
   };
 }
@@ -246,10 +246,25 @@ export class BridgeClient {
   async request(
     op: string,
     args: Record<string, unknown> = {},
-    opts: { retrySameId?: boolean } = {},
+    opts: { retrySameId?: boolean; signal?: AbortSignal } = {},
   ): Promise<BridgeReply> {
+    const cancelled = (): BridgeReply => ({ ok: false, error: { code: 'CANCELLED', message: '本次请求已取消等待' } });
+    if (opts.signal?.aborted) return cancelled();
     const id = this.nextRequestId(op);
-    return this.sendOnce(id, op, args, opts.retrySameId === true);
+    if (!opts.signal) return this.sendOnce(id, op, args, opts.retrySameId === true);
+    const signal = opts.signal;
+    let onAbort: () => void = () => undefined;
+    const aborted = new Promise<BridgeReply>(resolve => {
+      onAbort = () => {
+        const entry = this.pending.get(id);
+        if (entry) { clearTimeout(entry.timer); this.pending.delete(id); entry.settle(cancelled()); }
+        resolve(cancelled());
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    // 取消只结束本地等待；已提交给桥的操作要由 audio.clear 撤销。
+    try { return await Promise.race([this.sendOnce(id, op, args, false), aborted]); }
+    finally { signal.removeEventListener('abort', onAbort); }
   }
 
   /** 只给"重试复用 id"用:把 id 与内容再发一次。 */
