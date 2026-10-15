@@ -12,6 +12,31 @@
 /** 每个样本的字节数。 */
 const SAMPLE_BYTES = 2;
 
+/** 网络块不是播放帧：跨块攒齐固定帧，只在句末交出一次余量。 */
+export class StreamingPcmFramer {
+  private pending: Buffer = Buffer.alloc(0);
+  private readonly frameBytes: number;
+  private readonly alignment: number;
+  constructor(sampleRate: number, channels: number, frameMs: number) {
+    this.alignment = SAMPLE_BYTES * channels;
+    this.frameBytes = Math.max(1, Math.round(sampleRate * frameMs / 1000)) * this.alignment;
+  }
+  push(pcm: Buffer, final = false): Buffer[] {
+    this.pending = Buffer.concat([this.pending, pcm]);
+    const frames: Buffer[] = [];
+    while (this.pending.length >= this.frameBytes) {
+      frames.push(Buffer.from(this.pending.subarray(0, this.frameBytes)));
+      this.pending = this.pending.subarray(this.frameBytes);
+    }
+    if (final) {
+      if (this.pending.length % this.alignment) throw new Error('Incomplete PCM frame');
+      if (this.pending.length) frames.push(Buffer.from(this.pending));
+      this.pending = Buffer.alloc(0);
+    }
+    return frames;
+  }
+}
+
 /** 流式线性重采样：跨网络块保留插值相位，块边界不补零、不重复尾样本。 */
 export class StreamingMonoResampler {
   private pending: Buffer = Buffer.alloc(0);

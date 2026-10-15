@@ -44,7 +44,7 @@ import {
   type TranscriptLine,
 } from './call.ts';
 import { Segmenter, frameDb, hasWords, looksLikeWrongLanguage, transcribe } from './ear.ts';
-import { downmixToMono, durationMs, pcmToWav, resampleMono, sliceFrames, toChannels } from './pcm.ts';
+import { downmixToMono, durationMs, pcmToWav, resampleMono, StreamingPcmFramer, toChannels } from './pcm.ts';
 import { flushSentence, speechKey, takeSentences, worthSpeaking } from './sentences.ts';
 import { SshTunnel } from './ssh.ts';
 import { synthesizePcm } from './tts.ts';
@@ -205,6 +205,7 @@ export class PhoneWorld implements World {
   private speechAbort = new AbortController();
   private clearPending?: Promise<void>;
   private outputBlocked = false;
+  private qqDiagnostic = '';
   private playback = new PlaybackLedger();
   /** 换代:抢话或通话结束时 +1，正在跑的合成/发送据此自己停下。 */
   private speakGeneration = 0;
@@ -795,6 +796,16 @@ export class PhoneWorld implements World {
   }
 
   private onStatus(status: BridgeStatus, kind: 'hello' | 'status'): void {
+    // 轮询失败的具体原因在 diagnostics，call.error 只有笼统的“控制连接丢失”。
+    const qq = status.diagnostics?.find(d => d.id === 'qq');
+    if (qq) {
+      const detail = { level: qq.level, message: qq.message?.slice(0, 1000) };
+      const signature = JSON.stringify(detail);
+      if (signature !== this.qqDiagnostic) {
+        this.qqDiagnostic = signature;
+        this.log.info?.('QQ 控制诊断变化', detail);
+      }
+    }
     const format = status.audioFormat;
     if (typeof format?.sampleRate === 'number' && format.sampleRate > 0 && format.sampleRate !== this.bridgeRate) {
       this.bridgeRate = format.sampleRate;
@@ -978,6 +989,10 @@ export class PhoneWorld implements World {
    * `phone_say` 要照着这个数给她回执(挡下的没到他耳朵里,不能说成念了)。
    */
   private enqueue(sentences: string[]): { queued: number; capped: boolean } {
+    if (this.outputBlocked) {
+      void this.note('发送仍暂停，新句子没有进入合成队列。先调用 phone_stop 清理并确认成功，再在下一轮说话。');
+      return { queued: 0, capped: false };
+    }
     let queued = 0;
     let capped = false;
     for (const sentence of sentences) {
@@ -1005,17 +1020,26 @@ export class PhoneWorld implements World {
 
   /** 合成走一条链:一句接一句。播放侧独立排空，所以两句之间不会因为等合成而空一拍。 */
   private pumpSynthesis(): void {
-    if (this.synthBusy || !this.onCallNow()) return;
+    if (this.synthBusy || this.outputBlocked || !this.onCallNow()) return;
     this.synthBusy = true;
     const generation = this.speakGeneration;
     const signal = this.speechAbort.signal;
     const ledger = this.playback;
     void (async () => {
       try {
-        while (this.speakQueue.length && generation === this.speakGeneration && this.onCallNow()) {
+        while (this.speakQueue.length && !this.outputBlocked && generation === this.speakGeneration && this.onCallNow()) {
           const utterance = this.speakQueue.shift()!;
           const startedAt = this.now();
           let first = true;
+          const framer = new StreamingPcmFramer(this.bridgeRate, this.bridgeChannels, this.opts.cfg.frameMs);
+          const queueFrames = (frames: Buffer[]): void => {
+            for (const slice of frames) {
+              this.sequence++;
+              ledger.frame(utterance, 'utt-' + utterance.callId + '-' + this.sequence);
+              this.audioQueue.push({ pcm: slice, sequence: this.sequence, atMs: this.now(), utterance });
+            }
+            this.pumpWriter();
+          };
           const result = await synthesizePcm(utterance.text, {
             settings: this.opts.cfg.tts,
             apiKey: this.opts.secret(this.opts.cfg.tts.apiKeySecret),
@@ -1029,15 +1053,11 @@ export class PhoneWorld implements World {
                 first = false;
                 this.log.info?.('首段音频可用', { utteranceId: utterance.id, queueWaitMs: startedAt - utterance.queuedAt, firstAudioMs: this.now() - startedAt });
               }
-              for (const slice of sliceFrames(toChannels(pcm, this.bridgeChannels), this.bridgeRate, this.bridgeChannels, this.opts.cfg.frameMs)) {
-                this.sequence++;
-                ledger.frame(utterance, 'utt-' + utterance.callId + '-' + this.sequence);
-                this.audioQueue.push({ pcm: slice, sequence: this.sequence, atMs: this.now(), utterance });
-              }
-              this.pumpWriter();
+              queueFrames(framer.push(toChannels(pcm, this.bridgeChannels)));
             },
           });
           if (generation !== this.speakGeneration || signal.aborted) return;
+          queueFrames(framer.push(Buffer.alloc(0), true));
           ledger.finish(utterance, result.ok);
           if (!result.ok) {
             void this.note(result.error + '。可能已有部分音频提交；没有自动重播整句。');
@@ -1050,7 +1070,7 @@ export class PhoneWorld implements World {
         if (!signal.aborted) this.log.warn?.('合成这一路出错', { error: describe(error) });
       } finally {
         this.synthBusy = false;
-        if (this.speakQueue.length && this.onCallNow()) this.pumpSynthesis();
+        if (this.speakQueue.length && !this.outputBlocked && this.onCallNow()) this.pumpSynthesis();
       }
     })();
   }
@@ -1121,7 +1141,7 @@ export class PhoneWorld implements World {
     ledger.receipt({ id, callId: call.id, state: receipt?.state ?? 'queued' });
     this.paceEndMs = Math.max(this.paceEndMs, this.now()) + ms;
     this.wroteAudioMs += ms;
-    this.log.info?.('音频块提交', { sequence: chunk.sequence, audioMs: Math.round(ms), queuedMs: this.now() - chunk.atMs, replyMs: this.now() - sentAt });
+    this.log.info?.('音频块提交', { utteranceId: chunk.utterance.id, sequence: chunk.sequence, audioMs: Math.round(ms), queuedMs: this.now() - chunk.atMs, replyMs: this.now() - sentAt });
     if (this.stalledSinceMs) {
       this.log.info?.('桥重新接受音频', { stalledMs: this.now() - this.stalledSinceMs });
       this.stalledSinceMs = 0;
@@ -1274,7 +1294,7 @@ export class PhoneWorld implements World {
     return {
       name: 'phone_say',
       description:
-        '在已接通的电话里说话。text 只放要念的短句；回执确认进入合成队列，不代表已经播放或对方听见。没接通或本轮已停止时失败。',
+        '在已接通的电话里说话。text 只放要念的短句；回执确认进入合成队列，不代表已经播放或对方听见。没接通、本轮已停止或发送暂停时失败；发送暂停须先 phone_stop 清理成功，下一轮再说。',
       tags: ['speak'],
       parameters: {
         type: 'object',
@@ -1299,6 +1319,9 @@ export class PhoneWorld implements World {
               (call ? '等它变成"通话中"再调,或者先调 phone_answer 接起来。' : '要打给他就先调 phone_dial。'),
             failed: true,
           };
+        }
+        if (this.outputBlocked) {
+          return { text: '音频发送仍暂停，这一句没有进入合成队列。先调用 phone_stop 清理；确认成功后在下一轮重新说话。不要继续调用 phone_say 排队。', failed: true };
         }
         const raw = typeof args.text === 'string' ? args.text : '';
         if (raw.trim() === '') return { text: 'text 是空的,这一句没念。', failed: true };

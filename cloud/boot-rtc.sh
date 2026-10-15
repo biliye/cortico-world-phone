@@ -47,6 +47,7 @@ write_bridge_json() {
     "sampleRate": 48000,
     "channels": 2,
     "frameMs": 20,
+    "idleDrainMs": 1500,
     "inputDevice": "koishi_rtc_qq_speaker.monitor",
     "outputDevice": "koishi_rtc_qq_mic",
     "pulseServer": "unix:$T/runtime/pulse/native"

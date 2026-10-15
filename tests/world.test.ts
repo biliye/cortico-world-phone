@@ -161,6 +161,43 @@ describe('干装载与声明', () => {
 });
 
 describe('实机复核的回归边界', () => {
+  it('写入结果不明后拒绝新说话且不再合成，显式清理成功后才可恢复', async () => {
+    let synths = 0;
+    const base = fakeServices({ herSpeech: tone(800, 32000) });
+    const services = (async (...args: Parameters<typeof fetch>) => { synths++; return base(...args); }) as typeof fetch;
+    const host = await startWorld({}, services);
+    await connect(host);
+    bridge!.onRequest = op => op === 'audio.write' ? { ok: false, error: { code: 'TIMEOUT', message: 'lost acknowledgement' } } : undefined;
+    await callTool('phone_say', { text: '第一次。' });
+    await waitFor(() => host.events.some(e => e.text?.includes('已暂停后续发送')));
+    const retry = await callTool('phone_say', { text: '再说一次长句。' });
+    expect(retry.failed).toBe(true);
+    expect(retry.text).toContain('没有进入合成队列');
+    expect(retry.text).toContain('phone_stop');
+    expect(synths).toBe(1);
+    expect((await callTool('phone_status')).text).toContain('发送结果不明');
+    bridge!.onRequest = undefined;
+    expect((await callTool('phone_stop')).failed).toBe(false);
+    world!.outputTap()!.onEvent({ type: 'response.created' } as never);
+    expect((await callTool('phone_say', { text: '清理后新句。' })).failed).toBe(false);
+    await waitFor(() => synths === 2);
+  });
+  it('流式多次增量只发固定帧和一个句末尾帧，PCM 总量不变', async () => {
+    const pcm = tone(925, 32000);
+    const packets: string[] = [];
+    for (let i = 0; i < pcm.length; i += 1000) {
+      packets.push('data: ' + JSON.stringify({ data: { status: 1, audio: pcm.subarray(i, i + 1000).toString('hex') } }) + '\n\n');
+    }
+    packets.push('data: {"data":{"status":2}}\n\n');
+    const services = (async () => new Response(packets.join(''), { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch;
+    const host = await startWorld({ tts: { ...PHONE_DEFAULTS.tts, voiceId: 'test', streaming: true } }, services);
+    await connect(host);
+    await callTool('phone_say', { text: '完整连续。' });
+    const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
+    await waitFor(() => writes().length >= 3);
+    await new Promise(r => setTimeout(r, 100));
+    expect(writes().map(r => Buffer.from((r.args.frame as { data: string }).data, 'base64').length)).toEqual([76800, 76800, 24000]);
+  });
   it('队列满超过旧的 20 秒截止线，仍重试原块而不跳到下一块', async () => {
     let offset = 0;
     const host = await startWorld({}, fakeServices({ herSpeech: tone(800, 32000) }), () => Date.now() + offset);
@@ -262,7 +299,7 @@ describe('实机复核的回归边界', () => {
     await connect(host);
     await callTool('phone_say', { text: '流式测试。' });
     await waitFor(() => !!controller);
-    controller.enqueue(Buffer.from('data: ' + JSON.stringify({ data: { status: 1, audio: tone(200, 32000).toString('hex') } }) + '\n\n'));
+    controller.enqueue(Buffer.from('data: ' + JSON.stringify({ data: { status: 1, audio: tone(500, 32000).toString('hex') } }) + '\n\n'));
     await waitFor(() => bridge!.requests.some(r => r.op === 'audio.write'));
     expect((await callTool('phone_status')).text).toContain('完整合成 0 段');
     await callTool('phone_stop');

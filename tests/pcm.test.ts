@@ -8,8 +8,28 @@ import {
   resampleMono,
   sliceFrames,
   toChannels,
+  StreamingPcmFramer,
 } from '../src/pcm.ts';
 import { silence, stereo, tone } from './helpers/wav.ts';
+
+describe('流式 PCM 按播放帧拼接', () => {
+  it('任意网络分片不改变样本，不为每个网络尾块发短帧', () => {
+    const pcm = stereo(tone(925, 48000));
+    const framer = new StreamingPcmFramer(48000, 2, 400);
+    const frames: Buffer[] = [];
+    for (let offset = 0; offset < pcm.length; offset += 1001) {
+      frames.push(...framer.push(pcm.subarray(offset, offset + 1001)));
+    }
+    frames.push(...framer.push(Buffer.alloc(0), true));
+    expect(frames.map(f => durationMs(f, 48000, 2))).toEqual([400, 400, 125]);
+    expect(Buffer.concat(frames)).toEqual(pcm);
+    expect(framer.push(Buffer.alloc(0), true)).toEqual([]);
+  });
+  it('不完整声道样本不能在句末悄悄丢弃', () => {
+    const framer = new StreamingPcmFramer(48000, 2, 400);
+    expect(() => framer.push(Buffer.alloc(3), true)).toThrow('Incomplete PCM frame');
+  });
+});
 
 describe('pcm:声道', () => {
   it('下混:左右不同时取平均', () => {
