@@ -161,26 +161,29 @@ describe('干装载与声明', () => {
 });
 
 describe('实机复核的回归边界', () => {
-  it('写入结果不明后拒绝新说话且不再合成，显式清理成功后才可恢复', async () => {
+  it('一块没回执不封住整通:按原 id 再问几次,还问不到就记一笔继续往下说', async () => {
     let synths = 0;
     const base = fakeServices({ herSpeech: tone(800, 32000) });
     const services = (async (...args: Parameters<typeof fetch>) => { synths++; return base(...args); }) as typeof fetch;
-    const host = await startWorld({}, services);
+    // 重问之间等 10ms —— 生产里是 2000ms，这里只关心"会不会再问"。
+    const host = await startWorld({ audioWriteRetryWaitMs: 10, audioWriteRetries: 2 }, services);
     await connect(host);
     bridge!.onRequest = op => op === 'audio.write' ? { ok: false, error: { code: 'TIMEOUT', message: 'lost acknowledgement' } } : undefined;
     await callTool('phone_say', { text: '第一次。' });
-    await waitFor(() => host.events.some(e => e.text?.includes('已暂停后续发送')));
-    const retry = await callTool('phone_say', { text: '再说一次长句。' });
-    expect(retry.failed).toBe(true);
-    expect(retry.text).toContain('没有进入合成队列');
-    expect(retry.text).toContain('phone_stop');
-    expect(synths).toBe(1);
-    expect((await callTool('phone_status')).text).toContain('发送结果不明');
-    bridge!.onRequest = undefined;
-    expect((await callTool('phone_stop')).failed).toBe(false);
-    world!.outputTap()!.onEvent({ type: 'response.created' } as never);
-    expect((await callTool('phone_say', { text: '清理后新句。' })).failed).toBe(false);
+    const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
+    // 同一块按原 id 问 1+2 次 —— 桥按 id 记住在办的那条，重问不会把话念两遍。
+    // 只盯**第一块**自己：后面的块可以因为别的原因插进来(比如环境声触发抢话)，不该算进这条断言。
+    await waitFor(() => {
+      const first = writes()[0]?.args.playbackId;
+      return !!first && writes().filter(r => r.args.playbackId === first).length >= 3;
+    });
+    await waitFor(() => host.events.some(e => e.text?.includes('一直没确认收到')));
+    // 关键:以前这里是"暂停后续发送 + phone_say 直接拒绝"，整通就哑了
+    // (2026-10-15 那通就是这么一字不出的)。现在必须还能接着说。
+    const again = await callTool('phone_say', { text: '接着说的下一句。' });
+    expect(again.failed).toBe(false);
     await waitFor(() => synths === 2);
+    expect((await callTool('phone_status')).text).toContain('发送结果不明');
   });
   it('流式多次增量只发固定帧和一个句末尾帧，PCM 总量不变', async () => {
     const pcm = tone(925, 32000);

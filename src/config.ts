@@ -130,6 +130,21 @@ export interface PhoneConfigSection {
   maxSpeakSec: number;
   /** 往外发音频一帧多少毫秒。上游单帧硬上限是 1 秒。 */
   frameMs: number;
+  /**
+   * 一块音频等回执的上限(毫秒)。**比别的命令长得多**，理由见下。
+   *
+   * 2026-10-15 实测:桥自己的请求队列会**堵**(通话期间它会反复起停音频设备、重查诊断)，
+   * 堵住时 `audio.write` 十几秒不给回执。而"没回执"意味着什么桥自己也说不准 ——
+   * 可能收到了只是晚回，也可能压根没收到。用户定的规矩是**宁可晚、一个字都不丢**，
+   * 所以这一路该多等一会儿，而不是过十几秒就把整通电话判成哑巴(那天正是这么哑掉的)。
+   */
+  audioWriteTimeoutMs: number;
+  /** 一块音频最多重问几次。同一个 id 重问是安全的:桥按 id 记住在办的那条，不会念两遍。 */
+  audioWriteRetries: number;
+  /** 两次重问之间等多久(毫秒)。 */
+  audioWriteRetryWaitMs: number;
+  /** 清队列(`audio.clear`)最多试几次 —— 喊停这件事值得多试一次。 */
+  audioClearRetries: number;
   /** 桥重连的退避起点与上限(毫秒)。 */
   reconnectBaseMs: number;
   reconnectMaxMs: number;
@@ -156,6 +171,10 @@ export const PHONE_DEFAULTS: PhoneConfigSection = {
   bargeInMinMs: 500,
   maxSpeakSec: 30,
   frameMs: 400,
+  audioWriteTimeoutMs: 30000,
+  audioWriteRetries: 2,
+  audioWriteRetryWaitMs: 2000,
+  audioClearRetries: 2,
   reconnectBaseMs: 1000,
   reconnectMaxMs: 30000,
   logAudio: false,

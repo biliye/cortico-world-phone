@@ -108,6 +108,17 @@ function whyFailed(reply: { error?: { code?: string; message?: string } }): stri
   return code ? `${message}(${code})` : message;
 }
 
+/**
+ * 桥这么回，其实是"这一条我已经拿着了"。
+ *
+ * 上游对同一个 id 有两句挡回来的话:`REQUEST_ID_REUSED`(同一个 id 换了参数)和播放队列那句
+ * `Playback ID … unique while pending`(同一块还排在队里)。我们重问时参数一字不改,
+ * 所以撞上这两条只可能是**它已经收下了这一块** —— 当成失败反而会把已经念出去的话记成丢了。
+ */
+function alreadyHasBlock(reply: { error?: { code?: string; message?: string } }): boolean {
+  return reply.error?.code === 'REQUEST_ID_REUSED' || /unique while pending/i.test(reply.error?.message ?? '');
+}
+
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
 
 export interface PhoneWorldOptions {
@@ -204,7 +215,18 @@ export class PhoneWorld implements World {
   private writerBusy = false;
   private speechAbort = new AbortController();
   private clearPending?: Promise<void>;
-  private outputBlocked = false;
+  /**
+   * 桥没确认收到的音频块数(2026-10-15 改)。
+   *
+   * 这里原来是 `outputBlocked`:一块音频没拿到回执就把**整通电话封住** —— 后续不再合成、
+   * 不再发送,`phone_say` 也直接拒绝。2026-10-15 那通第一块就撞上桥不回执,于是整通一个字
+   * 没出去。用户定的规矩是「宁可晚、一个字都不丢」,而"没回执"本身说明不了没念
+   * (桥自己那段注释也写着这句);拿它来封住整通,代价远大于晚几秒。
+   * 现在:按原 id 多问几次,还问不到就**记下来、说清楚、继续往下说**。
+   */
+  private unconfirmedBlocks = 0;
+  /** 这一通里"有音频没被确认"这件事只当面说一次,别把她的上下文刷满。 */
+  private unconfirmedNoted = false;
   private qqDiagnostic = '';
   private playback = new PlaybackLedger();
   /** 换代:抢话或通话结束时 +1，正在跑的合成/发送据此自己停下。 */
@@ -638,7 +660,8 @@ export class PhoneWorld implements World {
     this.speakGeneration += 1;
     this.speechAbort.abort();
     this.speechAbort = new AbortController();
-    this.outputBlocked = false;
+    this.unconfirmedBlocks = 0;
+    this.unconfirmedNoted = false;
     this.speakBuffer = '';
     this.speakQueue = [];
     this.audioQueue = [];
@@ -989,10 +1012,6 @@ export class PhoneWorld implements World {
    * `phone_say` 要照着这个数给她回执(挡下的没到他耳朵里,不能说成念了)。
    */
   private enqueue(sentences: string[]): { queued: number; capped: boolean } {
-    if (this.outputBlocked) {
-      void this.note('发送仍暂停，新句子没有进入合成队列。先调用 phone_stop 清理并确认成功，再在下一轮说话。');
-      return { queued: 0, capped: false };
-    }
     let queued = 0;
     let capped = false;
     for (const sentence of sentences) {
@@ -1020,14 +1039,14 @@ export class PhoneWorld implements World {
 
   /** 合成走一条链:一句接一句。播放侧独立排空，所以两句之间不会因为等合成而空一拍。 */
   private pumpSynthesis(): void {
-    if (this.synthBusy || this.outputBlocked || !this.onCallNow()) return;
+    if (this.synthBusy || !this.onCallNow()) return;
     this.synthBusy = true;
     const generation = this.speakGeneration;
     const signal = this.speechAbort.signal;
     const ledger = this.playback;
     void (async () => {
       try {
-        while (this.speakQueue.length && !this.outputBlocked && generation === this.speakGeneration && this.onCallNow()) {
+        while (this.speakQueue.length && generation === this.speakGeneration && this.onCallNow()) {
           const utterance = this.speakQueue.shift()!;
           const startedAt = this.now();
           let first = true;
@@ -1070,21 +1089,21 @@ export class PhoneWorld implements World {
         if (!signal.aborted) this.log.warn?.('合成这一路出错', { error: describe(error) });
       } finally {
         this.synthBusy = false;
-        if (this.speakQueue.length && !this.outputBlocked && this.onCallNow()) this.pumpSynthesis();
+        if (this.speakQueue.length && this.onCallNow()) this.pumpSynthesis();
       }
     })();
   }
 
   private pumpWriter(): void {
-    if (this.writerBusy || this.outputBlocked || !this.onCallNow()) return;
+    if (this.writerBusy || !this.onCallNow()) return;
     this.writerBusy = true;
     const generation = this.speakGeneration;
     const signal = this.speechAbort.signal;
     void (async () => {
       try {
-        while (generation === this.speakGeneration && this.onCallNow() && !this.outputBlocked) {
+        while (generation === this.speakGeneration && this.onCallNow()) {
           if (this.clearPending) await this.clearPending;
-          if (generation !== this.speakGeneration || this.outputBlocked) break;
+          if (generation !== this.speakGeneration) break;
           const chunk = this.audioQueue.shift();
           if (!chunk) break;
           await this.writeChunk(chunk, generation, signal);
@@ -1093,11 +1112,20 @@ export class PhoneWorld implements World {
         if (!signal.aborted) this.log.warn?.('发送音频出错', { error: describe(error) });
       } finally {
         this.writerBusy = false;
-        if (this.audioQueue.length && this.onCallNow() && !this.outputBlocked) this.pumpWriter();
+        if (this.audioQueue.length && this.onCallNow()) this.pumpWriter();
       }
     })();
   }
 
+  /**
+   * 送一块音频。
+   *
+   * 「没回执」怎么办是 2026-10-15 改的,原因写在 `unconfirmedBlocks` 那段:桥自己的请求
+   * 队列会堵,堵住时 `audio.write` 十几秒不给回执 —— 而那不等于没念。所以这一路现在
+   * **按原 id 多问几次**(桥按 id 记住在办的那一条,重问只会把已有的结果给回来,不会把
+   * 同一块念两遍),问遍了还是没有,就如实记成"没确认",**继续往下说** ——
+   * 绝不因为一块没回执就把整通电话封住(那天就是这么一字不出)。
+   */
   private async writeChunk(chunk: AudioChunk, generation: number, signal: AbortSignal): Promise<void> {
     const call = this.current;
     const bridge = this.bridge;
@@ -1111,11 +1139,23 @@ export class PhoneWorld implements World {
     const ledger = this.playback;
     if (!chunk.utterance.frames.has(id)) ledger.frame(chunk.utterance, id);
     const sentAt = this.now();
-    const reply = await bridge.request('audio.write', {
-      callId: call.id, playbackId: id,
-      frame: { callId: call.id, encoding: 'pcm_s16le', sampleRate: this.bridgeRate,
-        channels: this.bridgeChannels, sequence: chunk.sequence, timestamp: this.now(), data: chunk.pcm.toString('base64') },
-    }, { signal });
+    // 兜底写死一遍(和 config 的默认值一致):老部署那份 config.json 里没有这几个键,
+    // 框架虽然会把 defaults 铺在前面,但"没有重试"和"有重试"是两种行为,不留给合并细节赌。
+    const attempts = Math.max(1, 1 + (this.opts.cfg.audioWriteRetries ?? 2));
+    let reply = await this.sendChunk(chunk, id, signal);
+    for (let attempt = 2; attempt <= attempts; attempt += 1) {
+      if (reply.ok || signal.aborted) break;
+      // "队列满"有它自己那条重试(见下),别混在一起。
+      if (reply.error?.message?.includes('queue is full')) break;
+      // 桥说这一条已经在办/已经办过 —— 那就是收到了。
+      if (alreadyHasBlock(reply)) { reply = { ok: true, data: { state: 'queued' } }; break; }
+      this.log.info?.('这一块音频没拿到回执，按原 id 再问一次', {
+        attempt, code: reply.error?.code, message: reply.error?.message,
+      });
+      await this.waitAudio(Math.max(0, this.opts.cfg.audioWriteRetryWaitMs ?? 2000), signal);
+      if (signal.aborted) break;
+      reply = await this.sendChunk(chunk, id, signal);
+    }
     if (signal.aborted || generation !== this.speakGeneration || this.current?.id !== call.id) return;
     this.maxLagMs = Math.max(this.maxLagMs, this.now() - chunk.atMs);
     if (!reply.ok) {
@@ -1130,11 +1170,17 @@ export class PhoneWorld implements World {
         await this.waitAudio(300, signal);
         return;
       }
-      // 没回执可能已经播了：保留这一块并暂停，绝不换 id 盲目重播或静默跳过。
+      // 问遍了还是没回执。这一块**不重播**(不知道念没念,重播可能念两遍),
+      // 也**不封住后面** —— 记成"没确认"、如实告诉她一句,然后继续往下说。
       ledger.receipt({ id, callId: call.id, state: 'uncertain' });
-      this.audioQueue.unshift(chunk);
-      this.outputBlocked = true;
-      void this.note('音频发送未获确认，已暂停后续发送并保留队列：' + whyFailed(reply) + '。可能已经播出部分；可用 phone_stop 清理后再说。');
+      this.unconfirmedBlocks += 1;
+      if (!this.unconfirmedNoted) {
+        this.unconfirmedNoted = true;
+        void this.note(
+          '有一块音频桥那边一直没确认收到(可能没念出去，也可能只是回执丢了)。**我接着说了** —— ' +
+            '他要是说没听见，调 phone_stop 清了再重说一遍。',
+        );
+      }
       return;
     }
     const receipt = reply.data as { state?: string } | undefined;
@@ -1146,6 +1192,24 @@ export class PhoneWorld implements World {
       this.log.info?.('桥重新接受音频', { stalledMs: this.now() - this.stalledSinceMs });
       this.stalledSinceMs = 0;
     }
+  }
+
+  /** 把一块按**原 id**交给桥。等回执的上限比别的命令长得多(见 config 那段)。 */
+  private sendChunk(chunk: AudioChunk, id: string, signal: AbortSignal) {
+    const call = this.current!;
+    return this.bridge!.request(
+      'audio.write',
+      {
+        callId: call.id,
+        playbackId: id,
+        frame: {
+          callId: call.id, encoding: 'pcm_s16le', sampleRate: this.bridgeRate,
+          channels: this.bridgeChannels, sequence: chunk.sequence, timestamp: this.now(),
+          data: chunk.pcm.toString('base64'),
+        },
+      },
+      { signal, id, timeoutMs: this.opts.cfg.audioWriteTimeoutMs ?? 30000 },
+    );
   }
 
   private waitAudio(ms: number, signal: AbortSignal): Promise<void> {
@@ -1168,15 +1232,23 @@ export class PhoneWorld implements World {
     this.paceEndMs = 0;
     const callId = this.current?.id;
     if (!callId) return true;
-    const generation = this.speakGeneration;
+    const attempts = Math.max(1, this.opts.cfg.audioClearRetries ?? 2);
     let ok = false;
     const previous = this.clearPending;
     const pending = (async () => {
       if (previous) await previous;
-      const reply = await this.send('audio.clear', { callId });
-      ok = reply.ok;
-      if (generation === this.speakGeneration) this.outputBlocked = !ok;
-      if (!ok) this.log.warn?.('桥端停止未确认', { code: reply.error?.code, message: reply.error?.message });
+      // 喊停这件事值得多试一次:桥的请求队列堵着时第一次常常拿不到回执(2026-10-15 实测)。
+      // 本地队列上面已经清空了,所以重试只是"再问一遍远端",不会多说一个字。
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        const reply = await this.send('audio.clear', { callId });
+        ok = reply.ok;
+        if (ok) break;
+        this.log.warn?.('桥端停止未确认', { attempt, code: reply.error?.code, message: reply.error?.message });
+        if (attempt < attempts) await this.waitAudio(1000, this.speechAbort.signal);
+      }
+      // 拿不到回执也**不封住下一轮**:本地确实已经停了,远端最多还剩嘴上那两三秒,
+      // 为此把整通后面的说话全断掉,代价比这几秒大得多(那天就是这么哑掉的)。
+      if (!ok) this.unconfirmedBlocks += 1;
     })();
     this.clearPending = pending;
     try { await pending; return ok; }
@@ -1294,7 +1366,7 @@ export class PhoneWorld implements World {
     return {
       name: 'phone_say',
       description:
-        '在已接通的电话里说话。text 只放要念的短句；回执确认进入合成队列，不代表已经播放或对方听见。没接通、本轮已停止或发送暂停时失败；发送暂停须先 phone_stop 清理成功，下一轮再说。',
+        '在已接通的电话里说话。text 只放要念的短句；回执确认进入合成队列，不代表已经播放或对方听见。没接通或本轮已停止时失败；某一块音频没拿到回执不会让整通停住，只会如实记一笔。',
       tags: ['speak'],
       parameters: {
         type: 'object',
@@ -1319,9 +1391,6 @@ export class PhoneWorld implements World {
               (call ? '等它变成"通话中"再调,或者先调 phone_answer 接起来。' : '要打给他就先调 phone_dial。'),
             failed: true,
           };
-        }
-        if (this.outputBlocked) {
-          return { text: '音频发送仍暂停，这一句没有进入合成队列。先调用 phone_stop 清理；确认成功后在下一轮重新说话。不要继续调用 phone_say 排队。', failed: true };
         }
         const raw = typeof args.text === 'string' ? args.text : '';
         if (raw.trim() === '') return { text: 'text 是空的,这一句没念。', failed: true };
@@ -1493,7 +1562,7 @@ export class PhoneWorld implements World {
         const ok = await this.clearSpeech();
         if (!hadCall) return '现在没有通话，本地合成和待发音频已清理。';
         return ok ? '本地合成和待发音频已停，桥已确认清队列。这一轮不再出声。' :
-          { text: '本地合成和待发音频已停，但桥端清队列失败，不能确认远端已安静；后续发送暂停，可再次 phone_stop。', failed: true };
+          { text: '本地合成和待发音频已停；桥那边清队列没拿到回执，不能确认远端已安静（最多还余两三秒）。这一轮不再出声，下一轮照常说。', failed: true };
       },
     };
   }
@@ -1513,6 +1582,10 @@ export class PhoneWorld implements World {
           this.bridgeOnline ? '桥连着。' : `桥没连着:${this.bridgeNote}`,
           `接听名单:${this.opts.cfg.callers.map((c) => String(c)).join('、') || '(没配，谁都不接)'}`,
           call ? `这一通已 ${since}，听到对方 ${this.heard} 句，完整合成 ${this.spoke} 段；${this.playback.summary()}。` : '',
+          // 没被确认的块单独说一句:她(和他)据此判断"要不要清了重说一遍"。
+          this.unconfirmedBlocks > 0
+            ? `有 ${this.unconfirmedBlocks} 块音频桥那边一直没确认收到(可能没念出去)。说话照常；他要是说没听见，可 phone_stop 清了重说。`
+            : '',
           typeof noise === 'number' ? `环境噪声底约 ${noise.toFixed(0)} dBFS。` : '',
           this.tunnel ? '隧道由这一路自己看着。' : '',
         ].filter((s) => s !== '');

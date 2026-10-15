@@ -242,16 +242,20 @@ export class BridgeClient {
    *
    * `retrySameId` 用来处理"连接断了、命令可能已经提交了"这种不确定:
    * 上游对同一个 id 会返回保留的回执而不重发命令,所以复用 id 是**安全的重试**。
+   *
+   * `id` / `timeoutMs` 是给音频那条路用的(2026-10-15 加):音频块要能**按原 id 再问一遍**。
+   * 桥那边按 id 记住在办的那一条,重问只会把它已有的结果给回来,不会把同一块念两遍 ——
+   * 所以"这块到底收下没有"这件事问得再久也不该被当成一次失败。
    */
   async request(
     op: string,
     args: Record<string, unknown> = {},
-    opts: { retrySameId?: boolean; signal?: AbortSignal } = {},
+    opts: { retrySameId?: boolean; signal?: AbortSignal; id?: string; timeoutMs?: number } = {},
   ): Promise<BridgeReply> {
     const cancelled = (): BridgeReply => ({ ok: false, error: { code: 'CANCELLED', message: '本次请求已取消等待' } });
     if (opts.signal?.aborted) return cancelled();
-    const id = this.nextRequestId(op);
-    if (!opts.signal) return this.sendOnce(id, op, args, opts.retrySameId === true);
+    const id = opts.id ?? this.nextRequestId(op);
+    if (!opts.signal) return this.sendOnce(id, op, args, opts.retrySameId === true, opts.timeoutMs);
     const signal = opts.signal;
     let onAbort: () => void = () => undefined;
     const aborted = new Promise<BridgeReply>(resolve => {
@@ -263,34 +267,35 @@ export class BridgeClient {
       signal.addEventListener('abort', onAbort, { once: true });
     });
     // 取消只结束本地等待；已提交给桥的操作要由 audio.clear 撤销。
-    try { return await Promise.race([this.sendOnce(id, op, args, false), aborted]); }
+    try { return await Promise.race([this.sendOnce(id, op, args, false, opts.timeoutMs), aborted]); }
     finally { signal.removeEventListener('abort', onAbort); }
   }
 
   /** 只给"重试复用 id"用:把 id 与内容再发一次。 */
-  private async sendOnce(id: string, op: string, args: Record<string, unknown>, allowRetry: boolean): Promise<BridgeReply> {
-    const first = await this.sendRaw(id, op, args);
+  private async sendOnce(id: string, op: string, args: Record<string, unknown>, allowRetry: boolean, timeoutMs?: number): Promise<BridgeReply> {
+    const first = await this.sendRaw(id, op, args, timeoutMs);
     if (first) return first;
     // 第一次没等到回执(多半是连接断了)。连接重连成功后,用同一个 id 再发一次。
     if (!allowRetry || this.stopped) return { ok: false, error: { code: 'NO_CONNECTION', message: '桥没连着' } };
     const back = await this.waitForConnection(Math.min(this.timeoutMs, 20000));
     if (!back) return { ok: false, error: { code: 'NO_CONNECTION', message: '桥没连着(等重连超时)' } };
     return (
-      (await this.sendRaw(id, op, args)) ?? {
+      (await this.sendRaw(id, op, args, timeoutMs)) ?? {
         ok: false,
         error: { code: 'NO_REPLY', message: '重发后仍没有回执' },
       }
     );
   }
 
-  private sendRaw(id: string, op: string, args: Record<string, unknown>): Promise<BridgeReply> | null {
+  private sendRaw(id: string, op: string, args: Record<string, unknown>, timeoutMs?: number): Promise<BridgeReply> | null {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+    const budget = Math.max(1000, timeoutMs ?? this.timeoutMs);
     return new Promise<BridgeReply>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         resolve({ ok: false, error: { code: 'TIMEOUT', message: `等 ${op} 的回执超时` } });
-      }, this.timeoutMs);
+      }, budget);
       this.pending.set(id, { settle: resolve, timer, op, args });
       try {
         ws.send(JSON.stringify({ type: 'request', id, op, args }));
