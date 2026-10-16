@@ -188,7 +188,7 @@ describe('实机复核的回归边界', () => {
   it('★ 她正说着时挂断:先把这句说完再发挂断命令,不是当场切断', async () => {
     // 他 2026-10-15 报的:他让她挂的时候她正说到一半,旧行为当场切断。
     // 4 秒长的一句:这样"还没说完"是**确定**的,不受机器快慢影响(1.6 秒那种在全量跑时会来不及)。
-    const host = await startWorld({ hangupGraceMs: 20000 }, fakeServices({ herSpeech: tone(4000, 32000) }));
+    const host = await startWorld({ hangupWaitMs: 20000 }, fakeServices({ herSpeech: tone(4000, 32000) }));
     await connect(host);
     await callTool('phone_say', { text: '这一句还没说完。' });
     const writes = () => bridge!.requests.filter(r => r.op === 'audio.write');
@@ -197,6 +197,7 @@ describe('实机复核的回归边界', () => {
     const reply = await callTool('phone_hangup', { reason: '他说挂吧' });
     expect(reply.failed).toBe(false);
     expect(reply.text).toContain('说完就挂');
+    expect(reply.text).toContain('大约还要');
     await new Promise((r) => setTimeout(r, 500));
     // 话还没说完 ⇒ 挂断命令一个字都还没发出去
     expect(hung().length).toBe(0);
@@ -206,6 +207,36 @@ describe('实机复核的回归边界', () => {
     // 挂了以后不再接新句子(等 phone.ended 到了再问 —— 命令发出与通话真正结束之间有几毫秒)
     await waitFor(() => host.events.some((e) => e.type === 'phone.ended'), 8000, 'phone.ended');
     expect((await callTool('phone_say', { text: '挂了以后还想说。' })).failed).toBe(true);
+  });
+
+  it('★ 排了很长的一段时挂断:等它说完,不按固定秒数切(2026-10-16 他复测的那条)', async () => {
+    // 他那次:她排了约 48 秒的 8 段,挂断请求在开口后 1 秒就到了,旧的 12 秒固定上限把话切在第 13 秒。
+    // 现在超过"估算剩余 + hangupWaitMs"才判定卡住 —— 这里给 2 秒余量,6 秒的音频必须念完才挂。
+    const host = await startWorld({ hangupWaitMs: 60000 }, fakeServices({ herSpeech: tone(6000, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '这一段很长,不许切。' });
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.write'), 8000, '开始发音频');
+    await callTool('phone_hangup', { reason: '复测' });
+    const hung = () => bridge!.requests.filter((r) => r.op === 'hangup');
+    await new Promise((r) => setTimeout(r, 3000));
+    // 3 秒时(旧行为早就炸了)它一个字都还没发出去:音频还在念
+    expect(hung().length).toBe(0);
+    await waitFor(() => hung().length >= 1, 15000, '说完了才挂');
+    // 而且是在音频基本放完之后才挂的(不是当场)
+    const lastWrite = bridge!.requests.filter((r) => r.op === 'audio.write').length;
+    expect(lastWrite).toBeGreaterThan(5);
+  });
+
+  it('安全上限:她说个不停时,到了 hangupWaitMs 也会挂(不会永远等下去)', async () => {
+    // 常规出路是"说完了",上限只在"真的一直说"时兜底 —— 但必须真的兜住:他 2026-10-15 担心的是
+    // "挂断迟迟不生效"。这里 8 秒的音频配 3 秒上限 ⇒ 3 秒左右就该挂,并且如实说清为什么。
+    const host = await startWorld({ hangupWaitMs: 3000 }, fakeServices({ herSpeech: tone(8000, 32000) }));
+    await connect(host);
+    await callTool('phone_say', { text: '这一段说个不停。' });
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'audio.write'), 8000, '开始发音频');
+    await callTool('phone_hangup', {});
+    await waitFor(() => bridge!.requests.some((r) => r.op === 'hangup'), 15000, '到上限之后挂');
+    await waitFor(() => host.events.some((e) => e.text?.includes('最多等了')), 8000, '如实说清为什么挂');
   });
 
   it('★ 接起后第一句之前垫一段静音(暖 QQ 那条媒体通道),而且只垫一次', async () => {
@@ -740,7 +771,7 @@ describe('工具回执', () => {
 
   it('★ 挂断第一次失败会**自动再试一次**;两次都失败就把出路说清,并带上上游的码', async () => {
     // 2026-10-15 起挂断是"排队 + 看护发命令",所以那两条结果走**通知**告诉她,不再是工具回执。
-    const host = await startWorld({ hangupGraceMs: 20000 }, fakeServices({ herSpeech: tone(300, 32000) }));
+    const host = await startWorld({ hangupWaitMs: 20000 }, fakeServices({ herSpeech: tone(300, 32000) }));
     await connect(host);
     bridge!.onRequest = (op) => (op === 'hangup' ? { ok: false, error: AUDIT_REFUSAL } : undefined);
     const reply = await callTool('phone_hangup', { reason: '他说挂吧' });
@@ -756,7 +787,7 @@ describe('工具回执', () => {
   });
 
   it('挂断第一次失败、第二次成了:如实说是哪一次成的', async () => {
-    const host = await startWorld({ hangupGraceMs: 20000 }, fakeServices({ herSpeech: tone(300, 32000) }));
+    const host = await startWorld({ hangupWaitMs: 20000 }, fakeServices({ herSpeech: tone(300, 32000) }));
     await connect(host);
     let attempts = 0;
     bridge!.onRequest = (op) => {

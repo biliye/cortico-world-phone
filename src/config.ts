@@ -146,13 +146,16 @@ export interface PhoneConfigSection {
   /** 清队列(`audio.clear`)最多试几次 —— 喊停这件事值得多试一次。 */
   audioClearRetries: number;
   /**
-   * 她调 `phone_hangup` 之后，最多等多少毫秒把这一句说完再挂（0 = 不等，当场挂）。
+   * 挂断最多等多少毫秒（0 = 不等，当场挂）。**这是安全上限，不是常规出路**。
    *
-   * 2026-10-15 他提的：他要挂、她正在说，旧行为当场切断。现在挂断分两步 —— 工具只排队，
-   * 看护等"这一轮的话说完 + 播放时间过去 + 连着安静两拍"再发真正的命令；这个数是兜底的上限，
-   * 免得她一直有新话就把挂断无限推迟。
+   * 2026-10-15 他提的"说完再挂"：他要挂、她正在说，旧行为当场切断。现在工具只排队，
+   * 看护等她把**已经排上的话**全部说完（连着安静两拍）再发真正的命令。
+   *
+   * ★ 常规出路是**她说完**（连着安静两拍）与**队列卡住不动**（`remainingAudioMs()` 连着几拍不减少），
+   * 这个数只在"她真的一直说个不停"时兜底。2026-10-16 他复测那一次是固定上限把 48 秒的话切在第 13 秒，
+   * 所以默认给得很宽（见 PHONE_DEFAULTS）。
    */
-  hangupGraceMs: number;
+  hangupWaitMs: number;
   /**
    * **接起后第一句之前**先垫多少毫秒静音(0 = 不垫)。
    *
@@ -192,7 +195,7 @@ export const PHONE_DEFAULTS: PhoneConfigSection = {
   audioWriteRetryWaitMs: 2000,
   audioClearRetries: 2,
   warmupMs: 300,
-  hangupGraceMs: 12000,
+  hangupWaitMs: 60000,
   reconnectBaseMs: 1000,
   reconnectMaxMs: 30000,
   logAudio: false,

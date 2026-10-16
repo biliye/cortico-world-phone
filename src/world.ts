@@ -112,6 +112,10 @@ const HANGUP_RETRY_DELAY_MS = 2500;
 const HANGUP_MIN_GRACE_MS = 1000;
 /** 要先连着安静这么多拍(WATCH_MS 一拍)才算"说完了" —— 免得同轮的告别正文还没到场就挂了。 */
 const HANGUP_QUIET_TICKS = 2;
+/** "还剩多少音频"每拍至少要减少这么多毫秒,才算它在往前走(少于这个数就记一次"没动")。 */
+const HANGUP_PROGRESS_MS = 100;
+/** 连着这么多拍"没动"就判定队列卡住,不再等。 */
+const HANGUP_STALL_TICKS = 5;
 
 /** 回执里那句"为什么没成":上游的原话 + 它给的码。**码先看** —— 2026-10-10 那次就是靠它认出来的。 */
 function whyFailed(reply: { error?: { code?: string; message?: string } }): string {
@@ -258,7 +262,9 @@ export class PhoneWorld implements World {
    * (正文),那句是**在工具返回之后**才进合成队列的。死等会把那句告别永远等掉,
    * 直接挂则把它连人带话一起切断。所以工具只排个队,真正的挂断交给看护。
    */
-  private hangupPending?: { atMs: number; reason: string; quietTicks: number };
+  private hangupPending?: { atMs: number; reason: string; quietTicks: number; lastRemaining: number; staleTicks: number };
+  /** 正在合成的那一句(挂断估时用;合成链是串行的,所以只有一个)。 */
+  private speakingUtterance?: Utterance;
   /** 这一通里"有音频没被确认"这件事只当面说一次,别把她的上下文刷满。 */
   private unconfirmedNoted = false;
   private qqDiagnostic = '';
@@ -1086,6 +1092,9 @@ export class PhoneWorld implements World {
       try {
         while (this.speakQueue.length && generation === this.speakGeneration && this.onCallNow()) {
           const utterance = this.speakQueue.shift()!;
+          // 记下"正在合成的那一句":挂断要估"还剩多少音频"时,这一句还没提交的部分也要算进去
+          // (只有它算得进去,才不会在它念到一半时按"队列已空"把它掐了)。
+          this.speakingUtterance = utterance;
           const startedAt = this.now();
           let first = true;
           const framer = new StreamingPcmFramer(this.bridgeRate, this.bridgeChannels, this.opts.cfg.frameMs);
@@ -1127,10 +1136,12 @@ export class PhoneWorld implements World {
           ledger.finish(utterance, result.ok);
           if (!result.ok) {
             void this.note(result.error + '。可能已有部分音频提交；没有自动重播整句。');
+            this.speakingUtterance = undefined;
             continue;
           }
           if (this.opts.cfg.logAudio) this.dumpAudio('out', pcmToWav(result.pcm, result.sampleRate));
           this.spoke++;
+          this.speakingUtterance = undefined;
         }
       } catch (error) {
         if (!signal.aborted) this.log.warn?.('合成这一路出错', { error: describe(error) });
@@ -1346,14 +1357,35 @@ export class PhoneWorld implements World {
       this.stopWatch();
       return;
     }
-    // 排好挂断的那一通:先等她说完(还要连着安静两拍),或者等过头了就直接挂。
+    // 排好挂断的那一通:等"已排上的话"全部说完,再发真正的挂断命令。
+    //
+    // ★ 上限**不能是固定秒数**(2026-10-16 他复测时正是这么切断的):他让她念一段长的(约 48 秒的
+    // 8 段),挂断请求在她开口后 1 秒就到了 —— 旧的 12 秒固定上限按时炸响,把话切在第 13 秒。
+    // 现在改成按**还剩多少音频**估(还没播完的 + 还没合成的 + 正在合成的这一句),
+    // 只有"等的时间已经超过估的剩余"才判定它卡住了、直接挂。
     if (this.hangupPending) {
       const waited = this.now() - this.hangupPending.atMs;
       const quiet = !this.synthBusy && this.speakQueue.length === 0 && this.audioQueue.length === 0 && this.now() >= this.paceEndMs;
       this.hangupPending.quietTicks = quiet ? this.hangupPending.quietTicks + 1 : 0;
+      // **兜底看进度,不看估算**:只要"还剩多少音频"还在减少,就说明它在一句一句往外走,继续等;
+      // 连着几拍都不减少,那才是真的卡住了(合成失败、桥不收、队列不动),这时才挂。
+      // 为什么不拿"等够了固定秒数"当兜底:他 2026-10-16 复测那一段,固定上限把 48 秒的话切在第 13 秒;
+      // 换成"按字数估时长"也靠不住 —— 估低一样切(单测里那条 6 秒的假音就被字面估成 1.8 秒)。
+      const remaining = this.remainingAudioMs();
+      this.hangupPending.staleTicks = remaining <= this.hangupPending.lastRemaining - HANGUP_PROGRESS_MS
+        ? 0
+        : this.hangupPending.staleTicks + 1;
+      this.hangupPending.lastRemaining = remaining;
+      const ceiling = this.opts.cfg.hangupWaitMs ?? 60000;
       const finished = this.hangupPending.quietTicks >= HANGUP_QUIET_TICKS && waited >= HANGUP_MIN_GRACE_MS;
-      if (finished || waited >= (this.opts.cfg.hangupGraceMs ?? 12000)) {
-        await this.commitHangup(finished ? '说完了' : `等够了 ${Math.round(waited / 1000)} 秒`);
+      const stalled = this.hangupPending.staleTicks >= HANGUP_STALL_TICKS;
+      const tooLong = ceiling > 0 && waited >= ceiling;
+      if (finished || stalled || tooLong) {
+        await this.commitHangup(
+          finished
+            ? '说完了'
+            : `${stalled ? '队列不动了' : `最多等了 ${Math.round(waited / 1000)} 秒`}(剩约 ${Math.round(remaining / 1000)} 秒没念)`,
+        );
       }
       return;
     }
@@ -1406,6 +1438,24 @@ export class PhoneWorld implements World {
   /** 现在手上还有没有没说完的话(工具回执用它说清楚"是这就挂"还是"说完再挂")。 */
   private sayingSomething(): boolean {
     return this.synthBusy || this.speakQueue.length > 0 || this.audioQueue.length > 0 || this.now() < this.paceEndMs;
+  }
+
+  /**
+   * 手上这些还没说出去的音频大概还要多久(毫秒)。
+   *
+   * 三部分:①已经提交给桥、还没播完的(`paceEndMs` 就是"最后一块播完的时刻");
+   * ②排在合成队列里、还没开始合成的句子;③正在合成的那一句里还没提交的部分。
+   * ②③用与 `maxSpeakSec` 同一把粗尺(一个汉字约 180 毫秒)估 —— 它只用来当挂断的兜底上限,
+   * 估大一点没坏处(最多多等一会儿),估小就会切话。
+   */
+  private remainingAudioMs(): number {
+    // ①本地还没提交给桥的块(**必须算上**:她一口气合成 48 秒时,这些就堆在 `audioQueue` 里,
+    //   而 `paceEndMs` 只跟着"已提交"的块走,单看它会把这一大堆看成"已经没了")
+    const local = this.audioQueue.reduce((sum, c) => sum + durationMs(c.pcm, this.bridgeRate, this.bridgeChannels), 0);
+    const submitted = Math.max(0, this.paceEndMs - this.now());
+    const queued = this.speakQueue.reduce((sum, u) => sum + u.text.length * 180, 0);
+    const inFlight = this.speakingUtterance ? this.speakingUtterance.text.length * 180 : 0;
+    return local + submitted + queued + inFlight;
   }
 
   /**
@@ -1624,11 +1674,16 @@ export class PhoneWorld implements World {
         // 真正那一下由看护在这一轮的话说完、播放时间也过去之后发出去;这一轮里她写的告别
         // (正文)照常会被念出来 —— 那正是"说完"的一部分。
         const pending = this.sayingSomething();
-        this.hangupPending = { atMs: this.now(), reason, quietTicks: 0 };
+        // `hangupWaitMs: 0` = 不等,当场挂(旧行为)。
+        if (!pending || (this.opts.cfg.hangupWaitMs ?? 8000) === 0) {
+          this.hangupPending = { atMs: this.now(), reason, quietTicks: HANGUP_QUIET_TICKS, lastRemaining: 0, staleTicks: 0 };
+          await this.commitHangup('当场挂');
+          return `已提交挂断${reason}。真正结束以 phone.ended 事件为准。`;
+        }
+        this.hangupPending = { atMs: this.now(), reason, quietTicks: 0, lastRemaining: Number.POSITIVE_INFINITY, staleTicks: 0 };
         this.startWatch();
-        return pending
-          ? `好,等这一句说完就挂${reason}。真正结束以 phone.ended 事件为准 —— 不用再调一次。`
-          : `这就挂${reason}。真正结束以 phone.ended 事件为准。`;
+        const estimate = Math.round(this.remainingAudioMs() / 1000);
+        return `好,已排好的话说完就挂${reason}(大约还要 ${estimate} 秒)。真正结束以 phone.ended 事件为准 —— 不用再调一次。`;
       },
     };
   }
