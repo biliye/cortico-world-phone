@@ -117,6 +117,17 @@ const HANGUP_PROGRESS_MS = 100;
 /** 连着这么多拍"没动"就判定队列卡住,不再等。 */
 const HANGUP_STALL_TICKS = 5;
 
+/**
+ * 上游那条"未确认音频太多"的拒收(`audio/common.mjs` 的 `accept()`,写死的 60 秒)。
+ *
+ * 为什么要专门认它:桥的"已播放"(`played`)回执只在 pacat **空闲 drain** 时才产生,而 drain 需要
+ * queue 连续空 `idleDrainMs`(部署里 1500ms)。她连续说话时每约 400ms 就写一块 ⇒ **永远不 drain**
+ * ⇒ 未确认量只增不减 ⇒ 到 60 秒桥就关门不收。
+ * 2026-10-16 实测那一段独白正是这样丢的尾巴:第 155 块被拒,后面的音频一个字都没进去
+ * (他听到"看看"就断了)。这不是我们写错,是这条通路的固有上限 —— 只能**主动停一下让它排空**。
+ */
+const UNCONFIRMED_AUDIO_HINT = 'unconfirmed audio';
+
 /** 回执里那句"为什么没成":上游的原话 + 它给的码。**码先看** —— 2026-10-10 那次就是靠它认出来的。 */
 function whyFailed(reply: { error?: { code?: string; message?: string } }): string {
   const message = reply.error?.message ?? '桥没给原因';
@@ -131,6 +142,10 @@ function whyFailed(reply: { error?: { code?: string; message?: string } }): stri
  * `Playback ID … unique while pending`(同一块还排在队里)。我们重问时参数一字不改,
  * 所以撞上这两条只可能是**它已经收下了这一块** —— 当成失败反而会把已经念出去的话记成丢了。
  */
+function isUnconfirmedWall(reply: { error?: { code?: string; message?: string } }): boolean {
+  return (reply.error?.message ?? '').toLowerCase().includes(UNCONFIRMED_AUDIO_HINT);
+}
+
 function alreadyHasBlock(reply: { error?: { code?: string; message?: string } }): boolean {
   return reply.error?.code === 'REQUEST_ID_REUSED' || /unique while pending/i.test(reply.error?.message ?? '');
 }
@@ -1211,19 +1226,33 @@ export class PhoneWorld implements World {
     // 兜底写死一遍(和 config 的默认值一致):老部署那份 config.json 里没有这几个键,
     // 框架虽然会把 defaults 铺在前面,但"没有重试"和"有重试"是两种行为,不留给合并细节赌。
     const attempts = Math.max(1, 1 + (this.opts.cfg.audioWriteRetries ?? 2));
-    let reply = await this.sendChunk(frame, id, requestId, signal);
+    let attemptId = requestId;
+    let reply = await this.sendChunk(frame, id, attemptId, signal);
     for (let attempt = 2; attempt <= attempts; attempt += 1) {
       if (reply.ok || signal.aborted) break;
       // "队列满"有它自己那条重试(见下),别混在一起。
       if (reply.error?.message?.includes('queue is full')) break;
       // 桥说这一条已经在办/已经办过 —— 那就是收到了。
       if (alreadyHasBlock(reply)) { reply = { ok: true, data: { state: 'queued' } }; break; }
+      if (isUnconfirmedWall(reply)) {
+        // 桥的"未确认音频到顶了":**停一下让它排空**,再拿**新请求 id** 重发同一块。
+        // 为什么必须换 id:上游按"id + 参数指纹"把回执也缓存了 —— 同 id 重问只会把这条拒收
+        // 原样还回来;为什么可以换 id:这一块根本没被收下(在 accept 之前就被拒),重发不会念两遍。
+        this.log.info?.('桥说未确认的音频到顶了,先停下让它排空再接着送', {
+          attempt, pausedMs: this.opts.cfg.flushPauseMs ?? 3000, sequence: chunk.sequence,
+        });
+        await this.waitAudio(Math.max(0, this.opts.cfg.flushPauseMs ?? 3000), signal);
+        if (signal.aborted) break;
+        attemptId = requestId + '-r' + attempt;
+        reply = await this.sendChunk(frame, id, attemptId, signal);
+        continue;
+      }
       this.log.info?.('这一块音频没拿到回执，按原 id 再问一次', {
         attempt, code: reply.error?.code, message: reply.error?.message,
       });
       await this.waitAudio(Math.max(0, this.opts.cfg.audioWriteRetryWaitMs ?? 2000), signal);
       if (signal.aborted) break;
-      reply = await this.sendChunk(frame, id, requestId, signal);
+      reply = await this.sendChunk(frame, id, attemptId, signal);
     }
     if (signal.aborted || generation !== this.speakGeneration || this.current?.id !== call.id) return;
     this.maxLagMs = Math.max(this.maxLagMs, this.now() - chunk.atMs);

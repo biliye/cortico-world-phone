@@ -146,14 +146,25 @@ export interface PhoneConfigSection {
   /** 清队列(`audio.clear`)最多试几次 —— 喊停这件事值得多试一次。 */
   audioClearRetries: number;
   /**
+   * 桥说"未确认的音频到顶了"（写死的 60 秒）时，先停多少毫秒让它排空，再接着送。
+   *
+   * 为什么要停：桥的"已播放"回执只在 pacat 空闲 drain 时产生，而 drain 要连续 `idleDrainMs`
+   * 没有新写入（部署里 1500ms）。她连续说话时每约 400ms 写一块 ⇒ 永远不 drain ⇒ 未确认只增不减
+   * ⇒ 到 60 秒桥就拒收新音频。2026-10-16 实测那一段独白的尾巴就是这么丢的（第 155 块被拒）。
+   * 停的这几毫秒会被听到（一段长的独白里大约每 55 秒有一处约 2～3 秒的停顿），
+   * 但比丢掉后面整段话强。给足 `idleDrainMs` 再加一点余量。
+   */
+  flushPauseMs: number;
+  /**
    * 挂断最多等多少毫秒（0 = 不等，当场挂）。**这是安全上限，不是常规出路**。
    *
    * 2026-10-15 他提的"说完再挂"：他要挂、她正在说，旧行为当场切断。现在工具只排队，
    * 看护等她把**已经排上的话**全部说完（连着安静两拍）再发真正的命令。
    *
    * ★ 常规出路是**她说完**（连着安静两拍）与**队列卡住不动**（`remainingAudioMs()` 连着几拍不减少），
-   * 这个数只在"她真的一直说个不停"时兜底。2026-10-16 他复测那一次是固定上限把 48 秒的话切在第 13 秒，
-   * 所以默认给得很宽（见 PHONE_DEFAULTS）。
+   * 这个数只在"她真的一直说个不停"时兜底 —— 所以默认给得很宽（2 分钟）。
+   * 教训（2026-10-16 两次复测）：上限给小了就会切话（12 秒那版切在第 13 秒，60 秒那版切在 60 秒）；
+   * 它是**安全网**，不是常规出路，宁可宽。
    */
   hangupWaitMs: number;
   /**
@@ -194,8 +205,9 @@ export const PHONE_DEFAULTS: PhoneConfigSection = {
   audioWriteRetries: 2,
   audioWriteRetryWaitMs: 2000,
   audioClearRetries: 2,
+  flushPauseMs: 3000,
   warmupMs: 300,
-  hangupWaitMs: 60000,
+  hangupWaitMs: 120000,
   reconnectBaseMs: 1000,
   reconnectMaxMs: 30000,
   logAudio: false,

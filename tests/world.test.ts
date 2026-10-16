@@ -239,6 +239,37 @@ describe('实机复核的回归边界', () => {
     await waitFor(() => host.events.some((e) => e.text?.includes('最多等了')), 8000, '如实说清为什么挂');
   });
 
+  it('★ 桥说"未确认音频到顶"(写死的 60 秒)时:停一下让它排空,换新请求 id 重发同一块,不丢话', async () => {
+    // 2026-10-16 实测:她连续说了约 55 秒,桥拒收第 155 块(Too much unconfirmed audio),
+    // 后面的音频一个字都没进去(他听到"看看"就断了)。桥的 played 回执只在空闲 drain 时产生,
+    // 连续说话就永远不 drain ⇒ 只能主动停一下让它排空。
+    let rejectCount = 0;
+    const host = await startWorld(
+      { flushPauseMs: 20, audioWriteRetries: 2 },
+      fakeServices({ herSpeech: tone(1200, 32000) }),
+    );
+    await connect(host);
+    bridge!.onRequest = (op) => {
+      if (op !== 'audio.write') return undefined;
+      rejectCount += 1;
+      return rejectCount <= 2
+        ? { ok: false, error: { code: 'BRIDGE_ERROR', message: 'Too much unconfirmed audio; flush before sending more.' } }
+        : undefined;
+    };
+    await callTool('phone_say', { text: '这一块不能被丢掉。' });
+    const writes = () => bridge!.requests.filter((r) => r.op === 'audio.write');
+    await waitFor(() => writes().length >= 3, 8000, '重发之后被收下');
+    const firstPlaybackId = String(writes()[0]!.args.playbackId);
+    const forFirst = writes().filter((w) => String(w.args.playbackId) === firstPlaybackId);
+    // 同一块问了不止一次,而且**每次都用新的请求 id** —— 上游按"id+参数"把这条拒收也缓存了,
+    // 同 id 重问只会把拒收回执原样还回来。
+    expect(forFirst.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(forFirst.map((w) => w.id)).size).toBe(forFirst.length);
+    // 桥后来收下了:没有"发送结果不明"那条通知(即那一块没被丢掉)
+    await new Promise((r) => setTimeout(r, 300));
+    expect(host.events.some((e) => e.text?.includes('一直没确认收到'))).toBe(false);
+  });
+
   it('★ 接起后第一句之前垫一段静音(暖 QQ 那条媒体通道),而且只垫一次', async () => {
     // 他实测第一句开头被吞("喂，我在"只听到"我在")。音频是完整进了声卡的(逐句标记是
     // "桥确认播放完成"),丢在 QQ 那条通道刚起的时候 ⇒ 垫静音去暖它,而不是拿她的第一个字去暖。
