@@ -23,8 +23,9 @@ import type {
   OutputTap,
   ToolDef,
   ToolOutcome,
+  ToolSpec,
   World,
-  WorldConsoleDecl,
+  WorldWebUiDecl,
   WorldHost,
 } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
@@ -163,6 +164,82 @@ function audioRequestId(callId: string, sequence: number): string {
 }
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
+
+/**
+ * 六个工具的静态声明(发给模型的字段与标签)。与实例方法共用同一份常量,自描述(`describe`)才不会
+ * 跟真发出去的那份各说各话;`handler` 留在方法里。运行时的 `phone_dial` 目标、`maxSpeakSec` 这些
+ * 按配置现读的东西都在 handler 的回执里,不进声明。
+ */
+const SAY_DECL: ToolSpec = {
+  name: 'phone_say',
+  description:
+    '在已接通的电话里说话。text 只放要念的短句；回执确认进入合成队列，不代表已经播放或对方听见。没接通或本轮已停止时失败；某一块音频没拿到回执不会让整通停住，只会如实记一笔。',
+  tags: ['speak'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      text: {
+        type: 'string',
+        description: '要说给他听的这句话本身。短句最好 —— 一个人张口就是一句,别一次塞一整段。',
+      },
+    },
+    required: ['text'],
+  },
+};
+
+const ANSWER_DECL: ToolSpec = {
+  name: 'phone_answer',
+  description:
+    '接起当前正在响的那通电话。只在没有自动接起(配置里 autoAnswer 关着)时才需要你调；' +
+    '没有来电或已经不在响铃阶段时会明确告诉你。',
+  tags: ['act'],
+  parameters: { type: 'object', additionalProperties: false, properties: {} },
+};
+
+const DIAL_DECL: ToolSpec = {
+  name: 'phone_dial',
+  description:
+    '主动拨一通语音电话给开发者(这一路只有这一个拨号目标,就是配置里那个人)。' +
+    '不在通话里时才能拨。拨出去他接起之后你们就在一通里:要说什么就调 phone_say(直接写下的正文这一路也会被念出去),' +
+    '他说的会作为事件给你。',
+  tags: ['act'],
+  parameters: { type: 'object', additionalProperties: false, properties: {} },
+};
+
+const HANGUP_DECL: ToolSpec = {
+  name: 'phone_hangup',
+  description:
+    '挂断当前这通电话。**是"说完再挂"**:你正在念的这一句会念完(这一轮里写的道别也会被念出来),' +
+    '然后才真正挂断 —— 所以道别就说在这一轮里。可以带一句为什么挂(只进你的上下文与日志，不会被念给对方)。' +
+    '调一次就够,不要重复调;真正结束以 phone.ended 事件为准。',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: { reason: { type: 'string', description: '挂断的原因，给自己与日志看。' } },
+  },
+};
+
+const STOP_DECL: ToolSpec = {
+  name: 'phone_stop',
+  description:
+    '**立刻停下你正在念的话**(把还没念完的收掉),这一轮剩下的正文也不再念。' +
+    '对方说「停」「停停停」「先别说了」这类意思时调它。调完这一轮就安静下来,下一次他开口你照常能说。',
+  tags: ['act'],
+  parameters: { type: 'object', additionalProperties: false, properties: {} },
+};
+
+const STATUS_DECL: ToolSpec = {
+  name: 'phone_status',
+  description: '现在电话这一路的实况:有没有通话、对方是谁、已经多久、桥通不通、合成和播放各确认到哪一步。',
+  tags: ['read'],
+  parameters: { type: 'object', additionalProperties: false, properties: {} },
+};
+
+export const PHONE_TOOL_DECLS: readonly ToolSpec[] = [
+  SAY_DECL, ANSWER_DECL, DIAL_DECL, HANGUP_DECL, STOP_DECL, STATUS_DECL,
+];
 
 export interface PhoneWorldOptions {
   cfg: PhoneConfigSection;
@@ -393,7 +470,7 @@ export class PhoneWorld implements World {
     }
   }
 
-  console(): WorldConsoleDecl {
+  webUi(): WorldWebUiDecl {
     return {
       config: [PHONE_CONFIG_GROUP],
       promptDocs: [
@@ -1539,21 +1616,7 @@ export class PhoneWorld implements World {
    */
   private sayTool(): ToolDef {
     return {
-      name: 'phone_say',
-      description:
-        '在已接通的电话里说话。text 只放要念的短句；回执确认进入合成队列，不代表已经播放或对方听见。没接通或本轮已停止时失败；某一块音频没拿到回执不会让整通停住，只会如实记一笔。',
-      tags: ['speak'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          text: {
-            type: 'string',
-            description: '要说给他听的这句话本身。短句最好 —— 一个人张口就是一句,别一次塞一整段。',
-          },
-        },
-        required: ['text'],
-      },
+      ...SAY_DECL,
       handler: async (args): Promise<string | ToolOutcome> => {
         const call = this.current;
         if (!call || call.phase !== 'connected') {
@@ -1614,12 +1677,7 @@ export class PhoneWorld implements World {
 
   private answerTool(): ToolDef {
     return {
-      name: 'phone_answer',
-      description:
-        '接起当前正在响的那通电话。只在没有自动接起(配置里 autoAnswer 关着)时才需要你调；' +
-        '没有来电或已经不在响铃阶段时会明确告诉你。',
-      tags: ['act'],
-      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      ...ANSWER_DECL,
       handler: async (): Promise<string | ToolOutcome> => {
         const call = this.current;
         if (!call) return { text: '现在没有来电。', failed: true };
@@ -1644,13 +1702,7 @@ export class PhoneWorld implements World {
    */
   private dialTool(): ToolDef {
     return {
-      name: 'phone_dial',
-      description:
-        '主动拨一通语音电话给开发者(这一路只有这一个拨号目标,就是配置里那个人)。' +
-        '不在通话里时才能拨。拨出去他接起之后你们就在一通里:要说什么就调 phone_say(直接写下的正文这一路也会被念出去),' +
-        '他说的会作为事件给你。',
-      tags: ['act'],
-      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      ...DIAL_DECL,
       handler: async (): Promise<string | ToolOutcome> => {
         const dial = dialTarget(this.opts.cfg);
         if (dial.target === '') {
@@ -1681,17 +1733,7 @@ export class PhoneWorld implements World {
 
   private hangupTool(): ToolDef {
     return {
-      name: 'phone_hangup',
-      description:
-        '挂断当前这通电话。**是"说完再挂"**:你正在念的这一句会念完(这一轮里写的道别也会被念出来),' +
-        '然后才真正挂断 —— 所以道别就说在这一轮里。可以带一句为什么挂(只进你的上下文与日志，不会被念给对方)。' +
-        '调一次就够,不要重复调;真正结束以 phone.ended 事件为准。',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: { reason: { type: 'string', description: '挂断的原因，给自己与日志看。' } },
-      },
+      ...HANGUP_DECL,
       handler: async (args): Promise<string | ToolOutcome> => {
         const call = this.current;
         if (!call) return { text: '现在没有通话可挂。', failed: true };
@@ -1727,12 +1769,7 @@ export class PhoneWorld implements World {
    */
   private stopTool(): ToolDef {
     return {
-      name: 'phone_stop',
-      description:
-        '**立刻停下你正在念的话**(把还没念完的收掉),这一轮剩下的正文也不再念。' +
-        '对方说「停」「停停停」「先别说了」这类意思时调它。调完这一轮就安静下来,下一次他开口你照常能说。',
-      tags: ['act'],
-      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      ...STOP_DECL,
       handler: async (): Promise<string | ToolOutcome> => {
         const hadCall = !!this.current;
         this.roundMuted = true;
@@ -1746,10 +1783,7 @@ export class PhoneWorld implements World {
 
   private statusTool(): ToolDef {
     return {
-      name: 'phone_status',
-      description: '现在电话这一路的实况:有没有通话、对方是谁、已经多久、桥通不通、合成和播放各确认到哪一步。',
-      tags: ['read'],
-      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      ...STATUS_DECL,
       handler: async (): Promise<string> => {
         const call = this.current;
         const noise = this.segmenter?.noiseFloor;

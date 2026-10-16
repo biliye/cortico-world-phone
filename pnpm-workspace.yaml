@@ -2,3 +2,5 @@
 # 框架 checkout 里这条写在它自己的 pnpm-workspace.yaml 里,包独立于框架,自己带一份。
 allowBuilds:
   esbuild: true
+minimumReleaseAgeExclude:
+  - cortico@0.2.0

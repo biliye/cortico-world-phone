@@ -26,8 +26,9 @@
   "main": "./src/index.ts",
   "cortico": {
     "kind": "world",
-    "api": 5,
-    "displayName": "电话"
+    "api": 6,
+    "displayName": "电话",
+    "describe": "describe.json"
   },
   "files": [
     "src",
@@ -36,6 +37,7 @@
     "probes",
     "AGENTS.md",
     "README.md",
+    "describe.json",
     "LICENSE",
     "THIRD_PARTY.md"
   ],
@@ -53,7 +55,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
-    "cortico": "^0.1.4",
+    "cortico": "^0.2.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
